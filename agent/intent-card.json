@@ -1,0 +1,151 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "intent_slug": "wintermute-tts",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-wintermute-tts.md",
+  "root_motivation": "wintermute speaks to a non-literate user; the conversational feel is the latency. A dedicated TTS daemon (`wm-tts`) backed by Piper streams PCM to PipeWire's default sink so the first syllable lands within 300 ms, cancels mid-utterance within 100 ms for barge-in, and serves ~50 pre-cached short phrases in <50 ms. ElevenLabs is opt-in for natural quality with Piper as the fallback. The same voice-pack resolver is shared (by contract) with peon-ping PRD-003 so we don't ship two TTS engines on this laptop.",
+  "user_persona": "Two consumers. Primary: `wm-dialog` programmatically publishes `wm.tts.speak` events on agorabus when the brain has something to say; cancels on barge-in via `wm.tts.cancel`. Secondary: developers/operators issue `wm say <text>` (from the platform's `wm` CLI) to smoke-test audio. The non-literate end-user never invokes wm-tts directly — she experiences only its output through the speaker.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --release --quiet -- --format=terse 2>&1 | awk '/test result:/ {gsub(\";\",\"\",$4); print $4}' | tail -1",
+    "target": 4
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "`wm.tts.speak` request → first audio frame at the speaker in ≤300 ms for a short phrase with Piper voice warm.",
+      "test": "tests/acceptance_ac1.rs::piper_first_audio_under_300ms — measures wall-clock from agorabus publish to first PCM frame queued on the PipeWire stream against a fake sink fixture (real sink path #[ignore]'d with manual procedure). Asserts elapsed_ms ≤ 300."
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "`wm.tts.cancel` → audio silenced at speaker in ≤100 ms; `wm.tts.cancel.ack` carries correct drained_ms.",
+      "test": "tests/acceptance_ac2.rs::cancel_silences_under_100ms — sends speak, then cancel ~200 ms in; asserts ring-buffer drains within 100 ms of cancel publish; asserts cancel.ack payload.drained_ms in [150, 350] window. Real-sink interrupt #[ignore]'d."
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "Pre-cached phrase (exact match, e.g. \"yes\") → speaker in ≤50 ms.",
+      "test": "tests/acceptance_ac3.rs::precache_hit_under_50ms — pre-warms cache with rendered WAV at ~/.cache/wintermute/tts/<voice>/<hash>.wav (tmpdir override); issues speak(\"yes\"); asserts elapsed_ms ≤ 50 from request to PipeWire enqueue. No Piper inference path is invoked (verified by counter)."
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "Voice hot-swap via `wm.tts.reload_voice` completes in <5 s and does not interrupt any non-cancellable in-flight speech.",
+      "test": "tests/acceptance_ac4.rs::reload_voice_under_5s — starts non-cancellable speak; sends reload_voice mid-utterance; asserts current utterance plays to completion AND new voice loaded within 5 s wall-clock of reload event. Uses fake Piper handle to avoid hardware in unit path."
+    },
+    {
+      "id": "AC5",
+      "level": "SHOULD",
+      "description": "ElevenLabs streaming path (opt-in via `WM_CLOUD_TTS_QUALITY=true`) reaches first audio in ≤400 ms over a typical broadband connection.",
+      "test": "tests/acceptance_ac5.rs::eleven_labs_first_audio_under_400ms — gated #[ignore] (requires API key and network); manual procedure documented in test doc-comment. Unit-level path verifies WebSocket frame parser correctness against a recorded fixture."
+    },
+    {
+      "id": "AC6",
+      "level": "SHOULD",
+      "description": "Cloud failure during ElevenLabs streaming falls back to Piper (mid-sentence cutover OR clean restart — implementer's choice, behavior documented).",
+      "test": "tests/acceptance_ac6.rs::eleven_labs_failure_falls_back_to_piper — injects WebSocket close mid-stream via mock; asserts wm-tts continues from current chunk via Piper synthesis (or, if 'clean restart' branch chosen, asserts the utterance restarts at sentence boundary). Documented choice asserted in test name."
+    },
+    {
+      "id": "AC7",
+      "level": "SHOULD",
+      "description": "60-minute steady-state run: no audio glitches, RSS growth <30 MB.",
+      "test": "tests/acceptance_ac7.rs::soak_60min_rss_growth_under_30mb — gated #[ignore] (long-running); manual procedure: run wm-tts under `procstat` for 60 minutes with a 1-utterance-per-15s driver; assert peak RSS - startup RSS < 30 MB AND no underrun events on the PipeWire stream."
+    },
+    {
+      "id": "AC8",
+      "level": "MAY",
+      "description": "The `wm-voicepack` resolver (mapping voice-pack identifier → backend) is published (in-repo for now per PRD §7) and peon-ping PRD-003 has a tracked integration ticket.",
+      "test": "tests/acceptance_ac8.rs::voicepack_resolver_present — asserts pub mod voicepack exposing resolve(name) -> Backend, and reads docs/PEON_PING_INTEGRATION.md as fixture confirming the cross-PRD coordination note. Tracking-ticket existence asserted out-of-band (not a Rust test)."
+    }
+  ],
+  "scope": [
+    "Rust binary `wm-tts`: long-lived daemon. Loads configured Piper voice on startup, subscribes to agorabus for `wm.tts.speak | wm.tts.cancel | wm.tts.reload_voice`, publishes `wm.tts.start | wm.tts.cancel.ack | wm.tts.end | wm.tts.error`.",
+    "Streaming pipeline: Piper inference → ring buffer → PipeWire stream consumer on default-sink. Frames flushed as they emerge; no full-WAV buffering.",
+    "Cancellation: AtomicBool::cancel + ring-buffer drop + PipeWire flush + (subprocess SIGTERM | piper-rs task cancel). cancel.ack published with drained_ms.",
+    "Pre-cache: on startup, render each phrase from /etc/wintermute/tts-cache.yaml via Piper into ~/.cache/wintermute/tts/<voice>/<phrase-hash>.wav. Speak requests exact-match the cache before invoking Piper inference.",
+    "ElevenLabs opt-in: when WM_CLOUD_TTS_QUALITY=true, streaming WebSocket to ElevenLabs; voice id from WM_TTS_VOICE_ID_CLOUD. Falls back to Piper on any cloud error.",
+    "In-repo `voicepack` module (Rust): maps voice-pack identifier → backend (Piper file path | ElevenLabs voice id | espeak-ng args). Per PRD §7 leaning, lives in-repo until peon-ping PRD-003 needs it, then extract to a shared crate."
+  ],
+  "non_goals": [
+    "Shipping Piper voice models in this crate. Voices are packaged separately (`wm-models` per PRD §7) and pulled on demand by wm-tts at startup.",
+    "Voice cloning of a family member — Fleet 3 (`wintermute-voice-clone`, license-constrained).",
+    "SSML / prosody markup — Fleet 2 if needed.",
+    "Sound effects mixed with speech — peon-ping's domain, not wm-tts.",
+    "Long-utterance chunking with silence markers — iter-2 (PRD §7 lean toward yes-later).",
+    "Defining the systemd .service file for wm-tts — installed by wintermute-platform's hook portion, not this Rust crate."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 25,
+    "msrv": "1.85",
+    "additional": {
+      "bin_name": "wm-tts",
+      "piper_backend_default": "subprocess (piper-rs is opt-in if binding proves stable per PRD §6)",
+      "default_voice": "en_US-lessac-medium",
+      "voice_env_var": "WM_TTS_VOICE",
+      "cache_dir": "~/.cache/wintermute/tts/<voice>/<phrase-hash>.wav",
+      "cache_config_path": "/etc/wintermute/tts-cache.yaml",
+      "pipewire_target": "default-sink",
+      "first_audio_target_ms": 300,
+      "cancel_ack_target_ms": 100,
+      "precache_serve_target_ms": 50,
+      "cloud_opt_in_env": "WM_CLOUD_TTS_QUALITY",
+      "cloud_voice_env": "WM_TTS_VOICE_ID_CLOUD",
+      "install_path": "~/.local/bin/ (per CLAUDE_SELF.md convention; same as wintermute-platform)"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why does wintermute need a dedicated wm-tts daemon rather than using a system-wide TTS like speech-dispatcher?",
+      "a": "Because barge-in cancellation must complete within 100 ms and PCM must reach the speaker within 300 ms of a speak request — neither is achievable through speech-dispatcher's blocking API. wm-tts owns its own ring buffer and PipeWire stream so cancel is a flush, not a kill-process round-trip. Also: wm-tts publishes start/end/cancel.ack on agorabus, which speech-dispatcher cannot do."
+    },
+    {
+      "why": 2,
+      "q": "Why Piper over the alternatives (Coqui XTTS, Bark, festival, espeak-ng)?",
+      "a": "Piper is MIT-licensed, CPU-only, real-time on a Pi5 and ~10× real-time on this desktop, and has a broad voice library. Coqui's license is non-commercial; Bark needs a GPU; festival/espeak-ng sound robotic and break the conversational feel. PRD §1 also notes peon-ping PRD-003's design independently lands on Piper — sharing the backend means one resolver instead of two."
+    },
+    {
+      "why": 3,
+      "q": "Why default to subprocess invocation of the `piper` binary rather than `piper-rs` bindings?",
+      "a": "Stability beats marginal startup-cost savings. PRD §6 explicitly flags piper-rs maturity as a risk; subprocess invocation is portable across piper releases and keeps the Rust crate's dep graph small. piper-rs is left as an opt-in for when its API stabilizes — the streaming-PCM contract is the same either way."
+    },
+    {
+      "why": 4,
+      "q": "Why a pre-cache of common phrases rather than relying on Piper's inference speed?",
+      "a": "Two reasons: (1) Even at 10× real-time, the first syllable of an utterance takes ~100-150 ms — pre-rendered WAVs at <50 ms feel snappy in a way live inference does not. (2) The pre-cache is the offline fallback: if Piper fails to load, the daemon can still serve the ~50 most-used phrases. The cache is voice-keyed so changing voice forces a re-render — small disk cost (~5 MB), large UX win."
+    },
+    {
+      "why": 5,
+      "q": "Why use agorabus topics (`wm.tts.speak`/`.cancel`) rather than a Unix socket RPC or stdin/stdout protocol?",
+      "a": "Cancellation needs out-of-band signaling: a stdin-driven `speak` is already mid-write when `cancel` arrives. agorabus gives wm-tts a separate channel for cancel without complicating the speak path. It also lets wm-audio's AEC drive automatic cancel on barge-in by publishing on the same bus the whole fleet listens to — no point-to-point coupling between modules."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "PRD §6 flags piper-rs maturity as a risk and offers subprocess as the fallback. Which does iter-1 commit to?",
+      "resolution": "Default: subprocess invocation of the `piper` binary. piper-rs lands as an opt-in feature flag (Cargo feature `piper-rs`) once a release proves stable in the wild. Both paths share the same streaming-PCM contract internally so the swap is mechanical."
+    },
+    {
+      "question": "PRD §7 open question: should `wm-voicepack` live in this crate's repo or be its own crate immediately?",
+      "resolution": "In-repo as a `voicepack` module under `wm-tts/src/voicepack.rs`. Extracted to a shared crate only when peon-ping PRD-003 begins consuming it. Premature extraction would multiply maintenance for zero current benefit; the cross-PRD contract is documented in `docs/PEON_PING_INTEGRATION.md`."
+    },
+    {
+      "question": "PRD §7 open question: should Piper voices ship bundled or be pulled on demand?",
+      "resolution": "On demand. wm-tts checks for the configured voice file at startup and downloads if missing (cached under ~/.cache/wintermute/voices/). A separate future `wm-models` package can pre-stage 3-5 popular voices, but wm-tts itself does not bundle them. Keeps the crate small and decouples voice-pack distribution from binary releases."
+    },
+    {
+      "question": "PRD §7 open question: long-utterance pre-emptive chunking with silence markers?",
+      "resolution": "Deferred to iter-2. iter-1 streams a single Piper invocation per utterance. Chunking is an optimization for utterances >30 s; the conversational use case rarely hits that, and adding the chunk-boundary state machine in iter-1 risks regressions on the 300 ms first-audio target."
+    },
+    {
+      "question": "PRD acceptance tests AC1/AC2/AC3/AC5/AC7 measure speaker latency — how at unit/integration level without committing to hardware?",
+      "resolution": "All hardware-timing assertions are gated #[ignore] with a documented manual procedure. The unit-level test exercises the in-process path up to the PipeWire enqueue (i.e., 'first frame queued'), which is the deterministic part of the latency budget. The 'last metre to the speaker' is verified manually by the operator."
+    }
+  ],
+  "created_at": "2026-05-25T02:56:31Z"
+}
