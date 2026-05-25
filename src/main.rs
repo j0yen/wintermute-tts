@@ -1,8 +1,10 @@
 //! `wm-tts` CLI entrypoint.
 //!
-//! iter-2 ships the clap dispatcher and a `start` action that loads
-//! the cache config. The other subcommands return a typed "not yet
-//! implemented" exit (2) so wiring tests can already pin the surface.
+//! iter-3 wires the pre-render pass: on `start`, load the cache YAML,
+//! construct a `PiperSubprocess` synth, and walk the phrase list,
+//! materializing missing WAVs into the per-voice cache directory.
+//! `speak`/`cancel`/`reload-voice` still return exit code 2 — the
+//! streaming + agorabus loop lands in iter-4.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
@@ -12,6 +14,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use wintermute_tts::cache::CacheManager;
+use wintermute_tts::synth::PiperSubprocess;
 use wintermute_tts::{DEFAULT_CACHE_CONFIG, TtsConfig, load_cache_yaml};
 
 #[derive(Parser, Debug)]
@@ -60,13 +64,29 @@ fn main() -> ExitCode {
         Command::Start => match load_cache_yaml(&cli.cache_config) {
             Ok(cache) => {
                 let cfg = TtsConfig::default();
-                info!(
-                    voice = %cfg.voice,
-                    phrases = cache.phrases.len(),
-                    cache_path = %cli.cache_config.display(),
-                    "wm-tts: config loaded; piper/pipewire wiring deferred to iter-3"
-                );
-                ExitCode::SUCCESS
+                let mgr = CacheManager::new(&cfg.cache_root, &cfg.voice);
+                let synth = PiperSubprocess::from_env();
+                match mgr.prerender(&cache.phrases, &synth) {
+                    Ok(report) => {
+                        info!(
+                            voice = %cfg.voice,
+                            phrases = cache.phrases.len(),
+                            hits = report.hits,
+                            rendered = report.rendered,
+                            failures = report.failures.len(),
+                            cache_root = %mgr.voice_dir().display(),
+                            "wm-tts: pre-render complete; pipewire+agorabus wiring deferred to iter-4"
+                        );
+                        for (phrase, why) in &report.failures {
+                            warn!(phrase = %phrase, error = %why, "wm-tts: phrase render failed");
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        error!(error = %err, "wm-tts: cache pre-render aborted");
+                        ExitCode::from(1)
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "wm-tts: failed to load cache config");

@@ -1,10 +1,14 @@
 //! wintermute-tts — text-to-speech for the wintermute fleet.
 //!
-//! iter-2 surface: configuration types and the pre-cache YAML parser.
-//! Piper inference, `PipeWire` streaming, and the agorabus subscribe loop
-//! arrive in iter-3.
+//! iter-3 surface: config + cache YAML parser (iter-2), plus a `Synth`
+//! abstraction with a subprocess `piper` backend and a per-voice WAV
+//! cache manager. `PipeWire` streaming, agorabus subscribe loop, and
+//! mid-utterance cancellation arrive in iter-4.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
+
+pub mod cache;
+pub mod synth;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
