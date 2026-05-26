@@ -1,12 +1,15 @@
 //! wintermute-tts — text-to-speech for the wintermute fleet.
 //!
-//! iter-3 surface: config + cache YAML parser (iter-2), plus a `Synth`
-//! abstraction with a subprocess `piper` backend and a per-voice WAV
-//! cache manager. `PipeWire` streaming, agorabus subscribe loop, and
-//! mid-utterance cancellation arrive in iter-4.
+//! iter-4 surface: config + cache YAML parser (iter-2), `Synth`
+//! abstraction with a subprocess `piper` backend + per-voice WAV cache
+//! manager (iter-3), and the agorabus topic + payload schema
+//! ([`bus`]) for the `wm.tts.*` request/event vocabulary. The live
+//! agorabus subscribe loop, `PipeWire` streaming, and mid-utterance
+//! cancellation arrive in iter-5.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod bus;
 pub mod cache;
 pub mod synth;
 
