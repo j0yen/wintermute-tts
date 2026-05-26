@@ -20,6 +20,16 @@
 //! the playback `tokio::select!` and `SIGKILL`s the player subprocess.
 //! `drained_ms` is reported as `0` until a future iter measures real
 //! playback position via a `PipeWire`-rs streaming consumer.
+//!
+//! iter-11 wires the cloud streaming fast path: when
+//! [`DaemonState::cloud`] is active, cache misses skip the file-based
+//! Piper render-then-play and instead stream `ElevenLabs` MP3 chunks
+//! into a `pw-cat --media-type=audio/mpeg -` subprocess via stdin. AC5
+//! (≤400ms first audio) becomes realizable; AC6 is honored via the
+//! "clean restart" interpretation — a failure before any frame reaches
+//! the player silently falls back to Piper, while a failure after at
+//! least one frame publishes `wm.tts.error{kind=stream}` and then
+//! restarts the utterance from scratch using Piper.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -29,6 +39,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{error, info, warn};
@@ -145,16 +156,15 @@ fn cache_hit_path(cache: &CacheManager, phrase: &str) -> Option<PathBuf> {
     if path.exists() { Some(path) } else { None }
 }
 
-/// Render `text` for the daemon's active voice into the cache entry
-/// path, returning that path on success. Used by [`handle_speak`] to
-/// turn a cache miss into a renderable audio file.
+/// Render `text` with Piper for the daemon's active voice into the
+/// per-voice WAV cache entry path, returning that path on success.
+/// Used by [`handle_speak`] both for the no-cloud path AND as the
+/// fallback after a cloud streaming failure (PRD §4 AC6 "clean
+/// restart" semantics).
 ///
-/// iter-8: when [`DaemonState::cloud`] is active, try the cloud
-/// backend first. Cloud writes MP3 bytes to the sibling
-/// `<voice_dir>/<hash>.mp3` cache slot (so subsequent identical
-/// requests reuse it) and the returned path is played with the MP3
-/// media type. Any cloud failure logs a warning and falls back to the
-/// Piper subprocess, satisfying PRD §4 AC6.
+/// iter-11 removed the cloud branch that lived here in iter-8: cloud
+/// rendering now always flows through [`try_cloud_stream_play`] so
+/// this helper stays a single Piper-only producer.
 ///
 /// The blocking Piper subprocess call is hoisted onto a
 /// `spawn_blocking` worker so the dispatch loop keeps draining events.
@@ -164,12 +174,11 @@ fn cache_hit_path(cache: &CacheManager, phrase: &str) -> Option<PathBuf> {
 /// raised by the synth backend, `kind="render"` for missing-binary,
 /// non-zero-exit, or task-panic failures.
 async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (String, String)> {
-    let (voice, target_wav, target_mp3, voice_dir) = {
+    let (voice, target_wav, voice_dir) = {
         let active = state.active.read().await;
         (
             active.voice.clone(),
             active.cache.entry_path(text),
-            active.cache.cloud_entry_path(text),
             active.cache.voice_dir(),
         )
     };
@@ -178,19 +187,6 @@ async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (S
             "io".to_string(),
             format!("cache dir {}: {e}", voice_dir.display()),
         ));
-    }
-
-    if state.cloud.is_active() {
-        match try_cloud_render(state, text, &target_mp3).await {
-            Ok(path) => return Ok(path),
-            Err(e) => {
-                warn!(
-                    text = %text,
-                    error = %e,
-                    "wm-tts: cloud render failed; falling back to piper"
-                );
-            }
-        }
     }
 
     let synth = Arc::clone(&state.synth);
@@ -212,21 +208,163 @@ async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (S
     }
 }
 
-/// Issue the cloud render and persist bytes to `target_mp3`. Returns
-/// the path on success so callers can hand it to [`spawn_player`].
-async fn try_cloud_render(
-    state: &DaemonState,
-    text: &str,
-    target_mp3: &Path,
-) -> Result<PathBuf, CloudError> {
-    let bytes = state.cloud.render(text).await?;
-    if let Err(e) = std::fs::write(target_mp3, &bytes) {
-        return Err(CloudError::Http(format!(
-            "writing cloud audio to {}: {e}",
-            target_mp3.display()
-        )));
+/// Argv (after the binary name) for the streaming player. Mirrors
+/// [`player_args`] except the audio source is stdin (`-`) instead of
+/// a file path, and the MP3 media-type is set unconditionally for
+/// `pw-cat` (the cloud streaming path always emits MP3 chunks). Other
+/// players (paplay, /bin/cat in tests) get no args — they read from
+/// stdin by default.
+fn streaming_player_args(player_bin: &str) -> Vec<OsString> {
+    let is_pw_cat = player_bin == "pw-cat" || player_bin.ends_with("/pw-cat");
+    let mut args: Vec<OsString> = Vec::new();
+    if is_pw_cat {
+        args.push("--playback".into());
+        args.push("--media-type".into());
+        args.push("audio/mpeg".into());
+        args.push("-".into());
     }
-    Ok(target_mp3.to_path_buf())
+    args
+}
+
+/// Spawn the streaming playback subprocess. Stdin is piped so the
+/// cloud chunk pump can write MP3 frames as they arrive; stdout is
+/// discarded; stderr is kept piped so a future iter can surface
+/// player diagnostics in `wm.tts.error`.
+fn spawn_streaming_player(player_bin: &str) -> Result<Child> {
+    let mut cmd = Command::new(player_bin);
+    cmd.args(streaming_player_args(player_bin));
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd.spawn()
+        .with_context(|| format!("spawn streaming player {player_bin}"))
+}
+
+/// Outcome of [`try_cloud_stream_play`]. The dispatch in
+/// [`handle_speak`] decides whether to fall back to Piper based on
+/// whether any audio reached the player before the failure.
+#[derive(Debug)]
+pub enum StreamOutcome {
+    /// Stream completed (or was cancelled). `duration_ms` is wall-clock
+    /// time from player spawn to player exit. `cancelled` is true iff
+    /// the cancel channel fired before the stream ended naturally.
+    Played {
+        /// Wall-clock milliseconds from player spawn to exit.
+        duration_ms: u64,
+        /// True iff cancellation interrupted the stream.
+        cancelled: bool,
+    },
+    /// Cloud refused to start a stream OR errored before any audio
+    /// frame reached the player. Caller should fall back to Piper
+    /// silently (no `wm.tts.error` event published).
+    FailedBeforeFrame(CloudError),
+    /// At least one audio frame was written to the player before the
+    /// stream errored. Caller should publish
+    /// `wm.tts.error{kind=stream}` and clean-restart the utterance
+    /// with Piper.
+    FailedMidStream(CloudError),
+}
+
+/// Stream cloud audio chunks into a freshly-spawned streaming player
+/// subprocess. Races the chunk pump against the supplied cancel
+/// receiver: if cancel fires, the player is killed and the outcome is
+/// `Played { cancelled: true }`.
+///
+/// Frame accounting drives the fallback policy in [`handle_speak`]:
+/// before any successful stdin write, errors are `FailedBeforeFrame`
+/// (silent Piper fallback); after at least one frame, errors are
+/// `FailedMidStream` (publish + clean restart).
+async fn try_cloud_stream_play(
+    state: &DaemonState,
+    cancel_rx: oneshot::Receiver<()>,
+    text: &str,
+) -> StreamOutcome {
+    let mut rx = match state.cloud.stream_render(text).await {
+        Ok(rx) => rx,
+        Err(e) => return StreamOutcome::FailedBeforeFrame(e),
+    };
+
+    let mut child = match spawn_streaming_player(&state.player_bin) {
+        Ok(c) => c,
+        Err(e) => {
+            return StreamOutcome::FailedBeforeFrame(CloudError::Http(format!(
+                "spawn streaming player: {e}"
+            )));
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return StreamOutcome::FailedBeforeFrame(CloudError::Http(
+            "streaming player has no piped stdin".into(),
+        ));
+    };
+
+    let played_start = Instant::now();
+    let mut frame_count: usize = 0;
+    let mut last_err: Option<CloudError> = None;
+    let mut cancelled = false;
+    let mut cancel_rx = cancel_rx;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                cancelled = true;
+                break;
+            }
+            item = rx.recv() => {
+                match item {
+                    Some(Ok(bytes)) => {
+                        if let Err(e) = stdin.write_all(&bytes).await {
+                            last_err = Some(CloudError::Http(format!(
+                                "player stdin write: {e}"
+                            )));
+                            break;
+                        }
+                        frame_count = frame_count.saturating_add(1);
+                    }
+                    Some(Err(e)) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Close stdin so a healthy player can flush its buffer and exit.
+    drop(stdin);
+
+    if cancelled {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let duration_ms = u64::try_from(played_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        return StreamOutcome::Played {
+            duration_ms,
+            cancelled: true,
+        };
+    }
+
+    if let Some(e) = last_err {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        if frame_count > 0 {
+            return StreamOutcome::FailedMidStream(e);
+        }
+        return StreamOutcome::FailedBeforeFrame(e);
+    }
+
+    // Stream ended cleanly — wait for the player to drain & exit.
+    let _ = child.wait().await;
+    let duration_ms = u64::try_from(played_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    StreamOutcome::Played {
+        duration_ms,
+        cancelled: false,
+    }
 }
 
 /// Build the argv (after the binary name) to play `audio` with
@@ -267,9 +405,22 @@ fn spawn_player(player_bin: &str, audio: &Path) -> Result<Child> {
         .with_context(|| format!("spawn {player_bin} {}", audio.display()))
 }
 
-/// Handle a `wm.tts.speak` request. Publishes `start` + `end` on cache
-/// hit; publishes `error{kind=render}` on cache miss (iter-5 limitation).
-/// Cancel interrupts via [`DaemonState::cancel_signal`].
+/// Handle a `wm.tts.speak` request.
+///
+/// Flow:
+/// 1. Publish `wm.tts.start`.
+/// 2. Cache-hit path: play the existing per-voice WAV with
+///    [`spawn_player`] + cancel race; publish `wm.tts.end`.
+/// 3. Cloud-active cache-miss path (iter-11): stream MP3 chunks
+///    straight into `pw-cat --media-type=audio/mpeg -` via
+///    [`try_cloud_stream_play`]. On `FailedBeforeFrame`, silently
+///    fall back to Piper. On `FailedMidStream`, publish
+///    `wm.tts.error{kind=stream}` and clean-restart with Piper (AC6).
+/// 4. Piper cache-miss path: [`render_on_demand`] then
+///    [`spawn_player`] + cancel race.
+///
+/// All paths converge on a final `wm.tts.end` publish (except the
+/// terminal-error cases, which publish `wm.tts.error` and return).
 async fn handle_speak(
     state: &DaemonState,
     publish: &mut dyn EventSink,
@@ -285,65 +436,57 @@ async fn handle_speak(
         .publish(outgoing::START, serde_json::to_value(&start)?)
         .await?;
 
+    let played_start = Instant::now();
+
     let hit = {
         let active = state.active.read().await;
         cache_hit_path(&active.cache, &req.text)
     };
-    let wav = match hit {
-        Some(p) => p,
-        None => match render_on_demand(state, &req.text).await {
-            Ok(p) => {
-                info!(
-                    phrase = %phrase_key(&req.text),
-                    path = %p.display(),
-                    "wm-tts: rendered cache miss on demand"
+
+    let cancelled = if let Some(wav) = hit {
+        play_file_with_cancel(state, &wav).await
+    } else if state.cloud.is_active() {
+        // Streaming-first: install cancel BEFORE calling cloud so a
+        // cancel arriving mid-handshake interrupts the pump.
+        let cancel_rx = install_cancel_slot(state).await;
+        let outcome = try_cloud_stream_play(state, cancel_rx, &req.text).await;
+        match outcome {
+            StreamOutcome::Played { cancelled, .. } => {
+                clear_cancel_slot(state).await;
+                cancelled
+            }
+            StreamOutcome::FailedBeforeFrame(e) => {
+                clear_cancel_slot(state).await;
+                warn!(
+                    text = %req.text,
+                    error = %e,
+                    "wm-tts: cloud stream failed before first frame; falling back to piper"
                 );
-                p
+                match piper_fallback(state, publish, &req.text).await {
+                    Ok(c) => c,
+                    Err(()) => return Ok(()), // publish_error already fired
+                }
             }
-            Err((kind, message)) => {
-                publish_error(publish, &kind, &message).await?;
-                return Ok(());
+            StreamOutcome::FailedMidStream(e) => {
+                clear_cancel_slot(state).await;
+                warn!(
+                    text = %req.text,
+                    error = %e,
+                    "wm-tts: cloud stream failed mid-utterance; restarting with piper"
+                );
+                publish_error(publish, "stream", &format!("{e}")).await?;
+                match piper_fallback(state, publish, &req.text).await {
+                    Ok(c) => c,
+                    Err(()) => return Ok(()), // publish_error already fired
+                }
             }
-        },
-    };
-
-    let played_start = Instant::now();
-    let mut child = match spawn_player(&state.player_bin, &wav) {
-        Ok(c) => c,
-        Err(e) => {
-            publish_error(publish, "io", &format!("spawn player: {e}")).await?;
-            return Ok(());
+        }
+    } else {
+        match piper_fallback(state, publish, &req.text).await {
+            Ok(c) => c,
+            Err(()) => return Ok(()),
         }
     };
-
-    // Install a one-shot cancel channel for this utterance.
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    {
-        let mut guard = state.cancel_signal.lock().await;
-        *guard = Some(cancel_tx);
-    }
-
-    // Race playback completion against cancel.
-    let cancelled;
-    tokio::select! {
-        wait_res = child.wait() => {
-            cancelled = false;
-            if let Err(e) = wait_res {
-                warn!(error = %e, "wm-tts: playback wait failed");
-            }
-        }
-        _ = cancel_rx => {
-            cancelled = true;
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    }
-
-    // Clear cancel slot if still ours.
-    {
-        let mut guard = state.cancel_signal.lock().await;
-        *guard = None;
-    }
 
     let duration_ms = u64::try_from(played_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let end = EndEvent {
@@ -359,6 +502,83 @@ async fn handle_speak(
         info!(text = %req.text, duration_ms, "wm-tts: playback cancelled");
     }
     Ok(())
+}
+
+/// Install a fresh cancel channel into [`DaemonState::cancel_signal`]
+/// and return the receiver. Overwrites any prior slot (the prior
+/// utterance has already raced its cancel and would have cleared on
+/// completion).
+async fn install_cancel_slot(state: &DaemonState) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let mut guard = state.cancel_signal.lock().await;
+    *guard = Some(tx);
+    rx
+}
+
+/// Drop the cancel slot (after the racing handler returned). Idempotent.
+async fn clear_cancel_slot(state: &DaemonState) {
+    let mut guard = state.cancel_signal.lock().await;
+    *guard = None;
+}
+
+/// Play an existing WAV/MP3 file with the daemon's player binary,
+/// racing playback completion against cancel. Returns `true` iff
+/// cancellation interrupted playback.
+async fn play_file_with_cancel(state: &DaemonState, wav: &Path) -> bool {
+    let cancel_rx = install_cancel_slot(state).await;
+    let mut child = match spawn_player(&state.player_bin, wav) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "wm-tts: spawn_player failed for cache hit");
+            clear_cancel_slot(state).await;
+            return false;
+        }
+    };
+    let cancelled;
+    tokio::select! {
+        wait_res = child.wait() => {
+            cancelled = false;
+            if let Err(e) = wait_res {
+                warn!(error = %e, "wm-tts: playback wait failed");
+            }
+        }
+        _ = cancel_rx => {
+            cancelled = true;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+    clear_cancel_slot(state).await;
+    cancelled
+}
+
+/// Piper-only render-then-play for both the no-cloud path and the
+/// cloud-fallback path. On Piper render error, publishes
+/// `wm.tts.error{kind}` and returns `Err(())` so the caller can short
+/// out before the `wm.tts.end` publish. On success, returns `true` iff
+/// cancellation interrupted playback.
+async fn piper_fallback(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    text: &str,
+) -> std::result::Result<bool, ()> {
+    let wav = match render_on_demand(state, text).await {
+        Ok(p) => {
+            info!(
+                phrase = %phrase_key(text),
+                path = %p.display(),
+                "wm-tts: rendered cache miss on demand"
+            );
+            p
+        }
+        Err((kind, message)) => {
+            if let Err(e) = publish_error(publish, &kind, &message).await {
+                error!(error = %e, "wm-tts: failed to publish render error");
+            }
+            return Err(());
+        }
+    };
+    Ok(play_file_with_cancel(state, &wav).await)
 }
 
 /// Handle a `wm.tts.cancel` request. Fires the cancel channel of the
@@ -782,8 +1002,9 @@ mod tests {
     }
 
     /// Stub backend that reports active and always errors. Used to
-    /// verify `render_on_demand` (via `handle_speak`) attempts the
-    /// cloud path AND falls through to Piper on failure (AC6).
+    /// verify `handle_speak` attempts the cloud streaming path AND
+    /// silently falls back to Piper on synchronous failure (AC6
+    /// before-frame case).
     #[derive(Default, Clone)]
     struct ErroringCloud {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -798,6 +1019,46 @@ mod tests {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(crate::cloud::CloudError::Http("forced".into()))
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    /// Stub backend that streams one Ok chunk, then Err. Drives the
+    /// AC6 mid-stream restart path: the first frame reaches the
+    /// player, the second is an error item on the receiver, and
+    /// `try_cloud_stream_play` returns `FailedMidStream`.
+    #[derive(Default, Clone)]
+    struct MidStreamFailCloud;
+
+    #[async_trait::async_trait]
+    impl crate::cloud::CloudSynth for MidStreamFailCloud {
+        async fn render(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<bytes::Bytes, crate::cloud::CloudError> {
+            Err(crate::cloud::CloudError::NotEnabled)
+        }
+        async fn stream_render(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<
+            tokio::sync::mpsc::Receiver<
+                std::result::Result<bytes::Bytes, crate::cloud::CloudError>,
+            >,
+            crate::cloud::CloudError,
+        > {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(bytes::Bytes::from_static(b"frame-1"))).await;
+                let _ = tx
+                    .send(Err(crate::cloud::CloudError::Http(
+                        "forced mid-stream".into(),
+                    )))
+                    .await;
+            });
+            Ok(rx)
         }
         fn is_active(&self) -> bool {
             true
@@ -819,9 +1080,10 @@ mod tests {
 
     #[tokio::test]
     async fn cloud_failure_falls_back_to_piper_then_publishes_error() {
-        // Cloud is active but always errors. Piper subprocess isn't
-        // available in the test environment, so the fallback ultimately
-        // publishes a render error — but the cloud must be tried first.
+        // Cloud is active but stream_render's default impl errors via
+        // render(). Piper subprocess isn't available in the test
+        // environment, so the silent fallback ultimately publishes a
+        // render error — but the cloud must be tried first.
         let cloud = Arc::new(ErroringCloud::default());
         let counter = Arc::clone(&cloud.calls);
         let (state, _g) = tmp_state_with_cloud(cloud);
@@ -840,6 +1102,8 @@ mod tests {
             "cloud backend must be invoked exactly once before fallback"
         );
         let events = sink.events.lock().unwrap();
+        // FailedBeforeFrame is silent — no stream-error event between
+        // START and the Piper render error.
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, outgoing::START);
         assert_eq!(events[1].0, outgoing::ERROR);
@@ -848,6 +1112,89 @@ mod tests {
         // Piper isn't installed in test env, so the fallback failed
         // — but that confirms the fallback path was taken.
         assert_eq!(err.kind, "render");
+    }
+
+    #[tokio::test]
+    async fn try_cloud_stream_play_reports_failed_before_frame_on_sync_err() {
+        // ErroringCloud.stream_render's default impl awaits render(),
+        // which returns Err synchronously → no player spawn, no chunk
+        // pump, FailedBeforeFrame.
+        let cloud = Arc::new(ErroringCloud::default());
+        let (mut state, _g) = tmp_state_with_cloud(cloud);
+        // Player binary doesn't matter — we never reach the spawn.
+        state.player_bin = "/usr/bin/false".into();
+        let (_tx, rx) = oneshot::channel::<()>();
+        match try_cloud_stream_play(&state, rx, "anything").await {
+            StreamOutcome::FailedBeforeFrame(_) => {}
+            other => panic!("expected FailedBeforeFrame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_cloud_stream_play_reports_failed_mid_stream_after_first_frame() {
+        // /bin/cat is the test stand-in for pw-cat: reads stdin, writes
+        // to /dev/null (Stdio::null), exits when stdin closes. The
+        // first Ok chunk succeeds; the second item is Err →
+        // FailedMidStream.
+        let cloud = Arc::new(MidStreamFailCloud);
+        let (mut state, _g) = tmp_state_with_cloud(cloud);
+        state.player_bin = "/bin/cat".into();
+        let (_tx, rx) = oneshot::channel::<()>();
+        match try_cloud_stream_play(&state, rx, "anything").await {
+            StreamOutcome::FailedMidStream(_) => {}
+            other => panic!("expected FailedMidStream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_speak_publishes_stream_error_on_mid_stream_failure_then_piper_restart() {
+        // Mid-stream cloud failure → wm.tts.error{kind=stream} → fall
+        // through to Piper (which is missing in CI) → wm.tts.error{
+        // kind=render}. Three events: START, ERROR(stream), ERROR(render).
+        let cloud = Arc::new(MidStreamFailCloud);
+        let (mut state, _g) = tmp_state_with_cloud(cloud);
+        state.player_bin = "/bin/cat".into();
+        let mut sink = MemSink::default();
+        let req = SpeakRequest {
+            text: "uncached mid-stream phrase".into(),
+            priority: None,
+            cancel_previous: false,
+        };
+        handle_speak(&state, &mut sink, &req)
+            .await
+            .expect("speak handler ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 3, "expected START, stream ERR, render ERR");
+        assert_eq!(events[0].0, outgoing::START);
+        assert_eq!(events[1].0, outgoing::ERROR);
+        let stream_err: ErrorEvent =
+            serde_json::from_value(events[1].1.clone()).expect("stream err decodes");
+        assert_eq!(stream_err.kind, "stream");
+        assert_eq!(events[2].0, outgoing::ERROR);
+        let render_err: ErrorEvent =
+            serde_json::from_value(events[2].1.clone()).expect("render err decodes");
+        assert_eq!(render_err.kind, "render");
+    }
+
+    #[test]
+    fn streaming_player_args_pw_cat_pipes_stdin_with_mp3_media_type() {
+        let args = streaming_player_args("pw-cat");
+        let owned: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            owned,
+            vec!["--playback", "--media-type", "audio/mpeg", "-"]
+        );
+    }
+
+    #[test]
+    fn streaming_player_args_non_pw_cat_is_empty() {
+        let args = streaming_player_args("/bin/cat");
+        assert!(args.is_empty());
+        let args = streaming_player_args("paplay");
+        assert!(args.is_empty());
     }
 
     #[tokio::test]
