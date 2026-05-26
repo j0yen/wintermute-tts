@@ -1,10 +1,10 @@
 //! `wm-tts` CLI entrypoint.
 //!
-//! iter-3 wires the pre-render pass: on `start`, load the cache YAML,
-//! construct a `PiperSubprocess` synth, and walk the phrase list,
-//! materializing missing WAVs into the per-voice cache directory.
-//! `speak`/`cancel`/`reload-voice` still return exit code 2 — the
-//! streaming + agorabus loop lands in iter-4.
+//! iter-5 wires `start` to the live daemon loop in [`wintermute_tts::daemon`]:
+//! load cache config, prerender missing WAVs, connect to agorabus,
+//! subscribe to `wm.tts.`, dispatch each event. `speak`/`cancel`/
+//! `reload-voice` remain stubs at exit code 2 — interactive single-shot
+//! CLI use lands in iter-6 (today the daemon is the only producer).
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
@@ -12,11 +12,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
-use wintermute_tts::cache::CacheManager;
-use wintermute_tts::synth::PiperSubprocess;
-use wintermute_tts::{DEFAULT_CACHE_CONFIG, TtsConfig, load_cache_yaml};
+use wintermute_tts::DEFAULT_CACHE_CONFIG;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,49 +59,36 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Start => match load_cache_yaml(&cli.cache_config) {
-            Ok(cache) => {
-                let cfg = TtsConfig::default();
-                let mgr = CacheManager::new(&cfg.cache_root, &cfg.voice);
-                let synth = PiperSubprocess::from_env();
-                match mgr.prerender(&cache.phrases, &synth) {
-                    Ok(report) => {
-                        info!(
-                            voice = %cfg.voice,
-                            phrases = cache.phrases.len(),
-                            hits = report.hits,
-                            rendered = report.rendered,
-                            failures = report.failures.len(),
-                            cache_root = %mgr.voice_dir().display(),
-                            "wm-tts: pre-render complete; pipewire+agorabus wiring deferred to iter-4"
-                        );
-                        for (phrase, why) in &report.failures {
-                            warn!(phrase = %phrase, error = %why, "wm-tts: phrase render failed");
-                        }
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        error!(error = %err, "wm-tts: cache pre-render aborted");
-                        ExitCode::from(1)
-                    }
+        Command::Start => match build_runtime() {
+            Ok(rt) => match rt.block_on(wintermute_tts::daemon::run(&cli.cache_config)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    error!(error = %err, "wm-tts: daemon exited with error");
+                    ExitCode::from(1)
                 }
-            }
+            },
             Err(err) => {
-                error!(error = %err, "wm-tts: failed to load cache config");
+                error!(error = %err, "wm-tts: failed to build tokio runtime");
                 ExitCode::from(1)
             }
         },
         Command::Speak { text } => {
-            warn!(text = %text, "wm-tts speak: not yet implemented (iter-3)");
+            warn!(text = %text, "wm-tts speak: deferred to iter-6 (use agorabus wm.tts.speak)");
             ExitCode::from(2)
         }
         Command::Cancel => {
-            warn!("wm-tts cancel: not yet implemented (iter-3)");
+            warn!("wm-tts cancel: deferred to iter-6 (use agorabus wm.tts.cancel)");
             ExitCode::from(2)
         }
         Command::ReloadVoice { voice } => {
-            warn!(voice = %voice, "wm-tts reload-voice: not yet implemented (iter-3)");
+            warn!(voice = %voice, "wm-tts reload-voice: deferred to iter-6");
             ExitCode::from(2)
         }
     }
+}
+
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
 }
