@@ -1,16 +1,19 @@
-//! Live agorabus subscribe loop for `wm-tts` (iter-6).
+//! Live agorabus subscribe loop for `wm-tts`.
 //!
 //! Wires the bus schema from [`crate::bus`] to a real subscribe loop. On
 //! a `wm.tts.speak` request, the daemon checks the per-voice cache for an
 //! exact (trimmed lowercase) match; cache hits play through `pw-cat`
-//! (`PipeWire` native CLI) and emit `wm.tts.start` + `wm.tts.end`.
-//!
-//! iter-6 wires cache misses to the Piper subprocess: the blocking
+//! (`PipeWire` native CLI) and emit `wm.tts.start` + `wm.tts.end`. Cache
+//! misses render on demand via the Piper subprocess (the blocking
 //! [`crate::synth::Synth::render`] call is hoisted onto a
-//! `tokio::task::spawn_blocking` worker, the resulting WAV is written
-//! straight into the cache entry path, and the cache-hit playback path
-//! is then reused. The next request for the same phrase resolves as a
-//! hit. Render failures still publish `wm.tts.error{kind="render"}`.
+//! `tokio::task::spawn_blocking` worker), then drop into the cache-hit
+//! playback path.
+//!
+//! iter-7 wires voice hot-swap: `wm.tts.reload_voice` builds a new
+//! per-voice [`CacheManager`], pre-renders the configured phrase set
+//! for the new voice, atomically swaps the daemon's [`ActiveVoice`]
+//! under a write lock, and publishes `wm.tts.reload.ack`. Subsequent
+//! speak requests resolve against the new voice's cache.
 //!
 //! Cancel is wired with a `oneshot::Sender<()>` stored in
 //! [`DaemonState`]: `wm.tts.cancel` fires the channel, which interrupts
@@ -26,12 +29,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{error, info, warn};
 
 use crate::bus::{
-    self, CancelAckEvent, EndEvent, ErrorEvent, Request, SpeakRequest, StartEvent, decode_request,
-    now_unix_ms, outgoing,
+    self, CancelAckEvent, EndEvent, ErrorEvent, ReloadAckEvent, Request, SpeakRequest, StartEvent,
+    decode_request, now_unix_ms, outgoing,
 };
 use crate::cache::CacheManager;
 use crate::synth::{PiperSubprocess, Synth, SynthError};
@@ -48,12 +51,24 @@ pub fn player_from_env() -> String {
     std::env::var("WM_TTS_PLAYER").unwrap_or_else(|_| DEFAULT_PLAYER.to_string())
 }
 
-/// Live daemon state passed to per-request handlers.
-pub struct DaemonState {
+/// Swappable portion of the daemon: the active voice id paired with
+/// the `CacheManager` rooted at the per-voice cache directory.
+///
+/// Held inside a [`tokio::sync::RwLock`] on [`DaemonState`]: speak
+/// requests take a brief read lock to snapshot the cache path; voice
+/// hot-swap takes the write lock to install a new [`ActiveVoice`].
+pub struct ActiveVoice {
+    /// Configured voice id (e.g. `en_US-lessac-medium`).
+    pub voice: String,
     /// Per-voice cache lookup (wraps `CacheManager`).
     pub cache: CacheManager,
-    /// Configured voice id.
-    pub voice: String,
+}
+
+/// Live daemon state passed to per-request handlers.
+pub struct DaemonState {
+    /// Active voice + its per-voice cache. Swappable atomically via
+    /// `wm.tts.reload_voice`.
+    pub active: RwLock<ActiveVoice>,
     /// Cancel channel for the active utterance. `Some` only while a
     /// `handle_speak` is awaiting playback; `handle_cancel` `take()`s it
     /// and `send(())`s to interrupt.
@@ -64,18 +79,30 @@ pub struct DaemonState {
     /// Shared by `Arc` so it can be moved into `spawn_blocking` workers
     /// while remaining accessible to the dispatch loop.
     pub synth: Arc<PiperSubprocess>,
+    /// Cache root directory; new voices construct per-voice cache
+    /// managers under this root on hot-swap.
+    pub cache_root: PathBuf,
+    /// Phrase set to (re-)prerender on voice swap. Mirrors the YAML
+    /// loaded at startup.
+    pub cache_phrases: Vec<String>,
 }
 
 impl DaemonState {
-    /// Construct a daemon state with the given config.
+    /// Construct a daemon state with the given config and the phrase
+    /// set used for pre-render on startup AND on voice hot-swap.
     #[must_use]
-    pub fn new(cfg: &TtsConfig) -> Self {
-        Self {
+    pub fn new(cfg: &TtsConfig, cache_phrases: Vec<String>) -> Self {
+        let active = ActiveVoice {
             cache: CacheManager::new(&cfg.cache_root, &cfg.voice),
             voice: cfg.voice.clone(),
+        };
+        Self {
+            active: RwLock::new(active),
             cancel_signal: Arc::new(Mutex::new(None)),
             player_bin: player_from_env(),
             synth: Arc::new(PiperSubprocess::from_env()),
+            cache_root: cfg.cache_root.clone(),
+            cache_phrases,
         }
     }
 }
@@ -105,8 +132,14 @@ fn cache_hit_path(cache: &CacheManager, phrase: &str) -> Option<PathBuf> {
 /// raised by the synth backend, `kind="render"` for missing-binary,
 /// non-zero-exit, or task-panic failures.
 async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (String, String)> {
-    let target = state.cache.entry_path(text);
-    let voice_dir = state.cache.voice_dir();
+    let (voice, target, voice_dir) = {
+        let active = state.active.read().await;
+        (
+            active.voice.clone(),
+            active.cache.entry_path(text),
+            active.cache.voice_dir(),
+        )
+    };
     if let Err(e) = std::fs::create_dir_all(&voice_dir) {
         return Err((
             "io".to_string(),
@@ -114,7 +147,6 @@ async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (S
         ));
     }
     let synth = Arc::clone(&state.synth);
-    let voice = state.voice.clone();
     let text_owned = text.to_string();
     let target_inner = target.clone();
     let res =
@@ -168,7 +200,11 @@ async fn handle_speak(
         .publish(outgoing::START, serde_json::to_value(&start)?)
         .await?;
 
-    let wav = match cache_hit_path(&state.cache, &req.text) {
+    let hit = {
+        let active = state.active.read().await;
+        cache_hit_path(&active.cache, &req.text)
+    };
+    let wav = match hit {
         Some(p) => p,
         None => match render_on_demand(state, &req.text).await {
             Ok(p) => {
@@ -262,17 +298,63 @@ async fn handle_cancel(state: &DaemonState, publish: &mut dyn EventSink) -> Resu
     Ok(())
 }
 
-/// Handle a `wm.tts.reload_voice` request. iter-5 logs and publishes
-/// `error{kind=voice}` — real hot-swap (re-prerender + atomic swap)
-/// lands in iter-6.
-async fn handle_reload_voice(publish: &mut dyn EventSink, new_voice: &str) -> Result<()> {
-    warn!(voice = %new_voice, "wm-tts reload-voice: deferred to iter-6");
-    publish_error(
-        publish,
-        "voice",
-        &format!("reload_voice deferred to iter-6 (requested={new_voice})"),
-    )
-    .await
+/// Handle a `wm.tts.reload_voice` request: build a new per-voice
+/// [`CacheManager`], pre-render the configured phrase set for that
+/// voice, then atomically swap [`DaemonState::active`] under a write
+/// lock and publish `wm.tts.reload.ack`.
+///
+/// Per-phrase render failures are non-fatal — the swap still completes
+/// (matches startup behavior) and the failure count is surfaced in the
+/// ack payload. Only a top-level pre-render failure (e.g. cache dir
+/// not writable) publishes `error{kind=voice}` and aborts the swap.
+async fn handle_reload_voice(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    new_voice: &str,
+) -> Result<()> {
+    let start_ms = now_unix_ms();
+    let new_cache = CacheManager::new(&state.cache_root, new_voice);
+    let report = match new_cache.prerender(&state.cache_phrases, state.synth.as_ref()) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(
+                voice = %new_voice,
+                error = %err,
+                "wm-tts: reload_voice prerender aborted"
+            );
+            return publish_error(
+                publish,
+                "voice",
+                &format!("prerender failed for {new_voice}: {err}"),
+            )
+            .await;
+        }
+    };
+    {
+        let mut active = state.active.write().await;
+        active.voice = new_voice.to_string();
+        active.cache = new_cache;
+    }
+    let elapsed_ms = now_unix_ms().saturating_sub(start_ms);
+    info!(
+        voice = %new_voice,
+        hits = report.hits,
+        rendered = report.rendered,
+        failures = report.failures.len(),
+        elapsed_ms,
+        "wm-tts: reload_voice complete"
+    );
+    let ack = ReloadAckEvent {
+        voice: new_voice.to_string(),
+        cache_hits: report.hits,
+        prerendered: report.rendered,
+        failures: report.failures.len(),
+        elapsed_ms,
+        ts: now_unix_ms(),
+    };
+    publish
+        .publish(outgoing::RELOAD_ACK, serde_json::to_value(&ack)?)
+        .await
 }
 
 async fn publish_error(publish: &mut dyn EventSink, kind: &str, message: &str) -> Result<()> {
@@ -330,7 +412,7 @@ pub async fn dispatch(
     match req {
         Request::Speak(s) => handle_speak(state, publish, &s).await,
         Request::Cancel(_) => handle_cancel(state, publish).await,
-        Request::ReloadVoice(rv) => handle_reload_voice(publish, &rv.voice).await,
+        Request::ReloadVoice(rv) => handle_reload_voice(state, publish, &rv.voice).await,
     }
 }
 
@@ -346,20 +428,26 @@ pub async fn run(cache_config: &Path) -> Result<()> {
     let cfg = TtsConfig::default();
     let cache_phrases = load_cache_yaml(cache_config)
         .with_context(|| format!("loading cache config from {}", cache_config.display()))?;
-    let state = DaemonState::new(&cfg);
+    let state = DaemonState::new(&cfg, cache_phrases.phrases.clone());
 
     // Pre-render (idempotent). Failures are non-fatal — cache misses
     // are rendered on demand at request time via `render_on_demand`.
-    match state.cache.prerender(&cache_phrases.phrases, state.synth.as_ref()) {
-        Ok(report) => info!(
-            voice = %cfg.voice,
-            phrases = cache_phrases.phrases.len(),
-            hits = report.hits,
-            rendered = report.rendered,
-            failures = report.failures.len(),
-            "wm-tts: pre-render complete"
-        ),
-        Err(err) => warn!(error = %err, "wm-tts: pre-render aborted; continuing"),
+    {
+        let active = state.active.read().await;
+        match active
+            .cache
+            .prerender(&cache_phrases.phrases, state.synth.as_ref())
+        {
+            Ok(report) => info!(
+                voice = %cfg.voice,
+                phrases = cache_phrases.phrases.len(),
+                hits = report.hits,
+                rendered = report.rendered,
+                failures = report.failures.len(),
+                "wm-tts: pre-render complete"
+            ),
+            Err(err) => warn!(error = %err, "wm-tts: pre-render aborted; continuing"),
+        }
     }
 
     // Connect to agorabus. Fail-open: if the bus isn't running, log and
@@ -432,13 +520,17 @@ mod tests {
     }
 
     fn tmp_state() -> (DaemonState, tempfile::TempDir) {
+        tmp_state_with_phrases(Vec::new())
+    }
+
+    fn tmp_state_with_phrases(phrases: Vec<String>) -> (DaemonState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = TtsConfig {
             voice: "test-voice".into(),
             cache_root: dir.path().to_path_buf(),
             cloud_quality: false,
         };
-        let state = DaemonState::new(&cfg);
+        let state = DaemonState::new(&cfg, phrases);
         (state, dir)
     }
 
@@ -456,18 +548,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_voice_publishes_error() {
+    async fn reload_voice_publishes_ack_and_swaps_active() {
+        let (state, _g) = tmp_state();
         let mut sink = MemSink::default();
-        handle_reload_voice(&mut sink, "en_GB-jenny")
+        assert_eq!(state.active.read().await.voice, "test-voice");
+
+        handle_reload_voice(&state, &mut sink, "en_GB-jenny")
             .await
             .expect("reload publishes");
-        let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0, outgoing::ERROR);
-        let parsed: ErrorEvent =
-            serde_json::from_value(events[0].1.clone()).expect("error decodes");
-        assert_eq!(parsed.kind, "voice");
-        assert!(parsed.message.contains("en_GB-jenny"));
+
+        {
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, outgoing::RELOAD_ACK);
+            let ack: ReloadAckEvent =
+                serde_json::from_value(events[0].1.clone()).expect("ack decodes");
+            assert_eq!(ack.voice, "en_GB-jenny");
+            // Empty phrase set → zero rendered, zero hits, zero failures.
+            assert_eq!(ack.cache_hits, 0);
+            assert_eq!(ack.prerendered, 0);
+            assert_eq!(ack.failures, 0);
+        }
+
+        // State swapped: active voice + the cache root now points at the
+        // new voice's per-voice subdir.
+        let active = state.active.read().await;
+        assert_eq!(active.voice, "en_GB-jenny");
+        assert!(active.cache.voice_dir().ends_with("en_GB-jenny"));
+    }
+
+    #[tokio::test]
+    async fn reload_voice_with_phrases_reports_failures_but_still_swaps() {
+        // piper isn't on PATH in CI → render fails per-phrase, but the
+        // swap still completes and the ack carries the failure count.
+        let (state, _g) =
+            tmp_state_with_phrases(vec!["yes".to_string(), "no".to_string()]);
+        let mut sink = MemSink::default();
+        handle_reload_voice(&state, &mut sink, "en_US-amy-medium")
+            .await
+            .expect("reload publishes");
+        {
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, outgoing::RELOAD_ACK);
+            let ack: ReloadAckEvent =
+                serde_json::from_value(events[0].1.clone()).expect("ack decodes");
+            assert_eq!(ack.voice, "en_US-amy-medium");
+            // No phrases were pre-existing for this fresh voice dir; piper
+            // either rendered them (if installed) or failed per-phrase.
+            assert_eq!(ack.cache_hits, 0);
+            assert_eq!(ack.prerendered + ack.failures, 2);
+        }
+        assert_eq!(state.active.read().await.voice, "en_US-amy-medium");
     }
 
     #[tokio::test]
@@ -514,7 +646,7 @@ mod tests {
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, outgoing::CANCEL_ACK);
-        assert_eq!(events[1].0, outgoing::ERROR);
+        assert_eq!(events[1].0, outgoing::RELOAD_ACK);
     }
 
     #[test]
@@ -534,13 +666,14 @@ mod tests {
         // is testable: write a fake WAV under the CacheManager layout
         // and confirm the (Trim + lowercase)-normalised lookup finds it.
         let (state, _g) = tmp_state();
-        let wav = state.cache.entry_path("hello world");
+        let active = state.active.read().await;
+        let wav = active.cache.entry_path("hello world");
         std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
         std::fs::write(&wav, b"RIFF\0\0\0\0WAVEfake").unwrap();
         assert_eq!(
-            cache_hit_path(&state.cache, "  Hello World "),
+            cache_hit_path(&active.cache, "  Hello World "),
             Some(wav.clone())
         );
-        assert_eq!(cache_hit_path(&state.cache, "nope"), None);
+        assert_eq!(cache_hit_path(&active.cache, "nope"), None);
     }
 }

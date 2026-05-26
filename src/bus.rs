@@ -30,6 +30,8 @@ pub mod outgoing {
     pub const END: &str = "wm.tts.end";
     /// Failure marker; payload carries `kind` + `message`.
     pub const ERROR: &str = "wm.tts.error";
+    /// Acknowledgement of a successful voice hot-swap.
+    pub const RELOAD_ACK: &str = "wm.tts.reload.ack";
 }
 
 /// Decoded request payloads. Returned by [`decode_request`].
@@ -98,6 +100,29 @@ pub struct EndEvent {
     /// from the WAV file size; iter-5 will report measured playback time.
     pub duration_ms: u64,
     /// Unix milliseconds when the utterance completed.
+    pub ts: u64,
+}
+
+/// Outbound `wm.tts.reload.ack` payload.
+///
+/// Emitted on successful `wm.tts.reload_voice` hot-swap. `prerendered`
+/// and `cache_hits` are the rendered/skipped counts from the per-voice
+/// pre-render pass; `failures` is the count of phrases the synth
+/// backend could not render for the new voice (still counted as a
+/// successful swap — startup tolerates per-phrase failures the same way).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReloadAckEvent {
+    /// Newly active voice id.
+    pub voice: String,
+    /// Phrases already on disk for the new voice (hits).
+    pub cache_hits: usize,
+    /// Phrases newly rendered as part of the swap.
+    pub prerendered: usize,
+    /// Phrases whose render failed; consumers may want to know.
+    pub failures: usize,
+    /// Wall-clock milliseconds spent in the swap.
+    pub elapsed_ms: u64,
+    /// Unix milliseconds when the swap completed.
     pub ts: u64,
 }
 
@@ -254,6 +279,18 @@ mod tests {
         let v = serde_json::to_value(&ack).expect("serializes");
         let back: CancelAckEvent = serde_json::from_value(v).expect("round trips");
         assert_eq!(ack, back);
+
+        let reload = ReloadAckEvent {
+            voice: "en_GB-jenny".into(),
+            cache_hits: 3,
+            prerendered: 2,
+            failures: 1,
+            elapsed_ms: 1280,
+            ts: 99,
+        };
+        let v = serde_json::to_value(&reload).expect("serializes");
+        let back: ReloadAckEvent = serde_json::from_value(v).expect("round trips");
+        assert_eq!(reload, back);
     }
 
     #[test]
