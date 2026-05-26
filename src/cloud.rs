@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::mpsc;
+
+use crate::cloud_ws::eleven_labs_stream;
 
 /// Env var: enable the cloud path. Accepts `1`, `true`, `yes`, `on`
 /// (case-insensitive). Anything else (including unset) leaves cloud off.
@@ -159,6 +162,36 @@ pub trait CloudSynth: Send + Sync {
     /// disabled stub; otherwise transport, status, or empty-body errors.
     async fn render(&self, text: &str) -> Result<Bytes, CloudError>;
 
+    /// Stream `text` as audio chunks. The receiver yields one or more
+    /// `Result<Bytes, CloudError>` items in arrival order and then
+    /// closes; the daemon's iter-11 cloud-active fast path pumps these
+    /// into `pw-cat --media-type=audio/mpeg -` stdin to realize AC5's
+    /// ≤400 ms first-audio target.
+    ///
+    /// The default implementation wraps [`Self::render`] into a
+    /// single-chunk receiver. Backends with native streaming (e.g.
+    /// [`ElevenLabsCloudSynth`] via [`crate::cloud_ws::eleven_labs_stream`])
+    /// override this with their own multi-chunk path.
+    ///
+    /// # Errors
+    ///
+    /// Returns synchronously when the backend cannot start a stream at
+    /// all (disabled stub, missing credentials, malformed URL). Per-frame
+    /// failures land on the receiver as `Err` items so the consumer has
+    /// one error-handling site.
+    async fn stream_render(
+        &self,
+        text: &str,
+    ) -> Result<mpsc::Receiver<Result<Bytes, CloudError>>, CloudError> {
+        let bytes = self.render(text).await?;
+        let (tx, rx) = mpsc::channel::<Result<Bytes, CloudError>>(1);
+        // send + drop both happen before we return rx; the receiver sees
+        // exactly one Ok(bytes) followed by None.
+        let _ = tx.send(Ok(bytes)).await;
+        drop(tx);
+        Ok(rx)
+    }
+
     /// True if this backend is actually configured to make calls.
     /// `DaemonState::render_on_demand` checks this before attempting
     /// cloud render.
@@ -214,6 +247,18 @@ impl ElevenLabsCloudSynth {
 
 #[async_trait]
 impl CloudSynth for ElevenLabsCloudSynth {
+    /// Native streaming via `ElevenLabs` WebSocket. Connection + send
+    /// happen on a spawned task; the receiver returns as soon as the
+    /// handshake completes (typically ~100-300 ms over broadband).
+    /// First audio frame typically arrives within ~50 ms of the upstream
+    /// backend receiving the text frame.
+    async fn stream_render(
+        &self,
+        text: &str,
+    ) -> Result<mpsc::Receiver<Result<Bytes, CloudError>>, CloudError> {
+        eleven_labs_stream(&self.config, text).await
+    }
+
     async fn render(&self, text: &str) -> Result<Bytes, CloudError> {
         let api_key = self
             .config
@@ -423,5 +468,87 @@ mod tests {
         let _g = EnvGuard::set(&[]);
         let backend = cloud_synth_from_env();
         assert!(!backend.is_active());
+    }
+
+    /// Stub backend whose `render` returns a caller-controlled payload.
+    /// Used to exercise the default [`CloudSynth::stream_render`] impl
+    /// without touching the network. Mirrors the [`DisabledCloudSynth`]
+    /// shape (no native streaming, so the trait default applies).
+    struct StubBytesSynth {
+        payload: Bytes,
+    }
+
+    #[async_trait]
+    impl CloudSynth for StubBytesSynth {
+        async fn render(&self, _text: &str) -> Result<Bytes, CloudError> {
+            Ok(self.payload.clone())
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    /// A render that always errors. Used to verify the trait default
+    /// propagates the error synchronously (no receiver returned).
+    struct StubErrSynth;
+
+    #[async_trait]
+    impl CloudSynth for StubErrSynth {
+        async fn render(&self, _text: &str) -> Result<Bytes, CloudError> {
+            Err(CloudError::Empty)
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn default_stream_render_emits_single_chunk_then_closes() {
+        let backend = StubBytesSynth {
+            payload: Bytes::from_static(b"mp3-bytes-here"),
+        };
+        let mut rx = backend
+            .stream_render("hi")
+            .await
+            .expect("stream_render returns Ok");
+        let first = rx.recv().await.expect("one item");
+        assert_eq!(
+            first.as_ref().map(Bytes::as_ref).unwrap(),
+            b"mp3-bytes-here"
+        );
+        assert!(rx.recv().await.is_none(), "receiver closes after one chunk");
+    }
+
+    #[tokio::test]
+    async fn default_stream_render_propagates_render_error_sync() {
+        let backend = StubErrSynth;
+        let err = backend.stream_render("hi").await.expect_err("must error");
+        assert!(matches!(err, CloudError::Empty));
+    }
+
+    #[tokio::test]
+    async fn disabled_stream_render_returns_not_enabled() {
+        let backend = DisabledCloudSynth;
+        let err = backend.stream_render("hi").await.expect_err("must error");
+        assert!(matches!(err, CloudError::NotEnabled));
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_stream_render_requires_credentials() {
+        // Construct an active backend with credentials present, then pass
+        // a stub config to stream_render via a synth whose CloudConfig
+        // omits the api key. The override delegates to eleven_labs_stream
+        // which short-circuits on missing creds — verifying the override
+        // wires through, without opening a network socket.
+        let cfg = CloudConfig {
+            enabled: true,
+            api_key: None, // <-- forces MissingApiKey
+            voice_id: Some("v-abc".into()),
+            model_id: DEFAULT_MODEL_ID.to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+        };
+        let backend = ElevenLabsCloudSynth::new(cfg).expect("client builds");
+        let err = backend.stream_render("hi").await.expect_err("must error");
+        assert!(matches!(err, CloudError::MissingApiKey));
     }
 }
