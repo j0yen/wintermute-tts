@@ -1,17 +1,22 @@
-//! Live agorabus subscribe loop for `wm-tts` (iter-5).
+//! Live agorabus subscribe loop for `wm-tts` (iter-6).
 //!
 //! Wires the bus schema from [`crate::bus`] to a real subscribe loop. On
 //! a `wm.tts.speak` request, the daemon checks the per-voice cache for an
 //! exact (trimmed lowercase) match; cache hits play through `pw-cat`
-//! (`PipeWire` native CLI) and emit `wm.tts.start` + `wm.tts.end`. Cache
-//! misses emit `wm.tts.error{kind="render"}` because full Piper streaming
-//! + a `PipeWire`-rs streaming consumer land in iter-6.
+//! (`PipeWire` native CLI) and emit `wm.tts.start` + `wm.tts.end`.
+//!
+//! iter-6 wires cache misses to the Piper subprocess: the blocking
+//! [`crate::synth::Synth::render`] call is hoisted onto a
+//! `tokio::task::spawn_blocking` worker, the resulting WAV is written
+//! straight into the cache entry path, and the cache-hit playback path
+//! is then reused. The next request for the same phrase resolves as a
+//! hit. Render failures still publish `wm.tts.error{kind="render"}`.
 //!
 //! Cancel is wired with a `oneshot::Sender<()>` stored in
 //! [`DaemonState`]: `wm.tts.cancel` fires the channel, which interrupts
 //! the playback `tokio::select!` and `SIGKILL`s the player subprocess.
-//! `drained_ms` is reported as `0` until iter-6 measures real playback
-//! position.
+//! `drained_ms` is reported as `0` until a future iter measures real
+//! playback position via a `PipeWire`-rs streaming consumer.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -29,6 +34,7 @@ use crate::bus::{
     now_unix_ms, outgoing,
 };
 use crate::cache::CacheManager;
+use crate::synth::{PiperSubprocess, Synth, SynthError};
 use crate::{TtsConfig, load_cache_yaml};
 
 /// Default playback binary. `pw-cat` ships with `PipeWire` and is the
@@ -54,6 +60,10 @@ pub struct DaemonState {
     pub cancel_signal: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// Player binary name (e.g. `pw-cat`, `paplay`).
     pub player_bin: String,
+    /// Synthesis backend used to render cache misses on demand.
+    /// Shared by `Arc` so it can be moved into `spawn_blocking` workers
+    /// while remaining accessible to the dispatch loop.
+    pub synth: Arc<PiperSubprocess>,
 }
 
 impl DaemonState {
@@ -65,6 +75,7 @@ impl DaemonState {
             voice: cfg.voice.clone(),
             cancel_signal: Arc::new(Mutex::new(None)),
             player_bin: player_from_env(),
+            synth: Arc::new(PiperSubprocess::from_env()),
         }
     }
 }
@@ -81,6 +92,45 @@ fn phrase_key(text: &str) -> String {
 fn cache_hit_path(cache: &CacheManager, phrase: &str) -> Option<PathBuf> {
     let path = cache.entry_path(phrase);
     if path.exists() { Some(path) } else { None }
+}
+
+/// Render `text` for the daemon's active voice into the cache entry
+/// path, returning that path on success. Used by [`handle_speak`] to
+/// turn a cache miss into a renderable WAV. The blocking Piper
+/// subprocess call is hoisted onto a `spawn_blocking` worker so the
+/// dispatch loop keeps draining events.
+///
+/// On error, returns `(kind, message)` shaped for direct use in
+/// [`publish_error`]: `kind="io"` for cache-dir or path I/O failures
+/// raised by the synth backend, `kind="render"` for missing-binary,
+/// non-zero-exit, or task-panic failures.
+async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (String, String)> {
+    let target = state.cache.entry_path(text);
+    let voice_dir = state.cache.voice_dir();
+    if let Err(e) = std::fs::create_dir_all(&voice_dir) {
+        return Err((
+            "io".to_string(),
+            format!("cache dir {}: {e}", voice_dir.display()),
+        ));
+    }
+    let synth = Arc::clone(&state.synth);
+    let voice = state.voice.clone();
+    let text_owned = text.to_string();
+    let target_inner = target.clone();
+    let res =
+        tokio::task::spawn_blocking(move || synth.render(&voice, &text_owned, &target_inner)).await;
+    match res {
+        Ok(Ok(())) => Ok(target),
+        Ok(Err(SynthError::Io { source, path })) => Err((
+            "io".to_string(),
+            format!("synth io on {}: {source}", path.display()),
+        )),
+        Ok(Err(e)) => Err(("render".to_string(), format!("{e}"))),
+        Err(join_err) => Err((
+            "render".to_string(),
+            format!("synth task join failed: {join_err}"),
+        )),
+    }
 }
 
 /// Spawn a playback subprocess for the WAV at `wav`. `pw-cat` needs the
@@ -118,17 +168,22 @@ async fn handle_speak(
         .publish(outgoing::START, serde_json::to_value(&start)?)
         .await?;
 
-    let Some(wav) = cache_hit_path(&state.cache, &req.text) else {
-        publish_error(
-            publish,
-            "render",
-            &format!(
-                "text not in pre-rendered cache; full Piper streaming lands iter-6 (phrase={:?})",
-                phrase_key(&req.text)
-            ),
-        )
-        .await?;
-        return Ok(());
+    let wav = match cache_hit_path(&state.cache, &req.text) {
+        Some(p) => p,
+        None => match render_on_demand(state, &req.text).await {
+            Ok(p) => {
+                info!(
+                    phrase = %phrase_key(&req.text),
+                    path = %p.display(),
+                    "wm-tts: rendered cache miss on demand"
+                );
+                p
+            }
+            Err((kind, message)) => {
+                publish_error(publish, &kind, &message).await?;
+                return Ok(());
+            }
+        },
     };
 
     let played_start = Instant::now();
@@ -294,9 +349,8 @@ pub async fn run(cache_config: &Path) -> Result<()> {
     let state = DaemonState::new(&cfg);
 
     // Pre-render (idempotent). Failures are non-fatal — cache misses
-    // surface as `wm.tts.error{kind=render}` events at request time.
-    let synth = crate::synth::PiperSubprocess::from_env();
-    match state.cache.prerender(&cache_phrases.phrases, &synth) {
+    // are rendered on demand at request time via `render_on_demand`.
+    match state.cache.prerender(&cache_phrases.phrases, state.synth.as_ref()) {
         Ok(report) => info!(
             voice = %cfg.voice,
             phrases = cache_phrases.phrases.len(),
