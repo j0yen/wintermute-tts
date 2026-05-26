@@ -74,6 +74,18 @@ impl CacheManager {
     /// Path the manager will use for a given phrase.
     #[must_use]
     pub fn entry_path(&self, phrase: &str) -> PathBuf {
+        self.entry_path_with_ext(phrase, "wav")
+    }
+
+    /// Sibling path for cloud-rendered audio. Same SHA-256 hash and
+    /// per-voice directory as [`Self::entry_path`], but with a `.mp3`
+    /// extension so the Piper WAV and cloud MP3 caches never collide.
+    #[must_use]
+    pub fn cloud_entry_path(&self, phrase: &str) -> PathBuf {
+        self.entry_path_with_ext(phrase, "mp3")
+    }
+
+    fn entry_path_with_ext(&self, phrase: &str, ext: &str) -> PathBuf {
         let normalized = phrase.trim().to_lowercase();
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
@@ -82,7 +94,8 @@ impl CacheManager {
         for byte in digest.iter().take(8) {
             name.push_str(&format!("{byte:02x}"));
         }
-        name.push_str(".wav");
+        name.push('.');
+        name.push_str(ext);
         self.voice_dir().join(name)
     }
 

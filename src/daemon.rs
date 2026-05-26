@@ -21,6 +21,7 @@
 //! `drained_ms` is reported as `0` until a future iter measures real
 //! playback position via a `PipeWire`-rs streaming consumer.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::bus::{
     decode_request, now_unix_ms, outgoing,
 };
 use crate::cache::CacheManager;
+use crate::cloud::{CloudError, CloudSynth, cloud_synth_from_env};
 use crate::synth::{PiperSubprocess, Synth, SynthError};
 use crate::{TtsConfig, load_cache_yaml};
 
@@ -79,6 +81,11 @@ pub struct DaemonState {
     /// Shared by `Arc` so it can be moved into `spawn_blocking` workers
     /// while remaining accessible to the dispatch loop.
     pub synth: Arc<PiperSubprocess>,
+    /// Cloud TTS backend. Tried first (iter-8) when
+    /// `CloudSynth::is_active` is true; failures fall back to
+    /// [`Self::synth`]. Defaults to a disabled stub when the cloud env
+    /// vars are unset.
+    pub cloud: Arc<dyn CloudSynth>,
     /// Cache root directory; new voices construct per-voice cache
     /// managers under this root on hot-swap.
     pub cache_root: PathBuf,
@@ -90,8 +97,23 @@ pub struct DaemonState {
 impl DaemonState {
     /// Construct a daemon state with the given config and the phrase
     /// set used for pre-render on startup AND on voice hot-swap.
+    /// Cloud backend is read from environment via
+    /// [`cloud_synth_from_env`]; tests can inject one via
+    /// [`Self::with_cloud`].
     #[must_use]
     pub fn new(cfg: &TtsConfig, cache_phrases: Vec<String>) -> Self {
+        Self::with_cloud(cfg, cache_phrases, cloud_synth_from_env())
+    }
+
+    /// Construct a daemon state with an injected cloud backend. The
+    /// production path uses [`Self::new`]; tests use this to wire a
+    /// stub backend that returns canned bytes or a forced error.
+    #[must_use]
+    pub fn with_cloud(
+        cfg: &TtsConfig,
+        cache_phrases: Vec<String>,
+        cloud: Arc<dyn CloudSynth>,
+    ) -> Self {
         let active = ActiveVoice {
             cache: CacheManager::new(&cfg.cache_root, &cfg.voice),
             voice: cfg.voice.clone(),
@@ -101,11 +123,13 @@ impl DaemonState {
             cancel_signal: Arc::new(Mutex::new(None)),
             player_bin: player_from_env(),
             synth: Arc::new(PiperSubprocess::from_env()),
+            cloud,
             cache_root: cfg.cache_root.clone(),
             cache_phrases,
         }
     }
 }
+
 
 /// Decide the cache key for a phrase. Exact lowercase trimmed match
 /// against the prerendered set.
@@ -123,20 +147,29 @@ fn cache_hit_path(cache: &CacheManager, phrase: &str) -> Option<PathBuf> {
 
 /// Render `text` for the daemon's active voice into the cache entry
 /// path, returning that path on success. Used by [`handle_speak`] to
-/// turn a cache miss into a renderable WAV. The blocking Piper
-/// subprocess call is hoisted onto a `spawn_blocking` worker so the
-/// dispatch loop keeps draining events.
+/// turn a cache miss into a renderable audio file.
+///
+/// iter-8: when [`DaemonState::cloud`] is active, try the cloud
+/// backend first. Cloud writes MP3 bytes to the sibling
+/// `<voice_dir>/<hash>.mp3` cache slot (so subsequent identical
+/// requests reuse it) and the returned path is played with the MP3
+/// media type. Any cloud failure logs a warning and falls back to the
+/// Piper subprocess, satisfying PRD §4 AC6.
+///
+/// The blocking Piper subprocess call is hoisted onto a
+/// `spawn_blocking` worker so the dispatch loop keeps draining events.
 ///
 /// On error, returns `(kind, message)` shaped for direct use in
 /// [`publish_error`]: `kind="io"` for cache-dir or path I/O failures
 /// raised by the synth backend, `kind="render"` for missing-binary,
 /// non-zero-exit, or task-panic failures.
 async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (String, String)> {
-    let (voice, target, voice_dir) = {
+    let (voice, target_wav, target_mp3, voice_dir) = {
         let active = state.active.read().await;
         (
             active.voice.clone(),
             active.cache.entry_path(text),
+            active.cache.cloud_entry_path(text),
             active.cache.voice_dir(),
         )
     };
@@ -146,13 +179,27 @@ async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (S
             format!("cache dir {}: {e}", voice_dir.display()),
         ));
     }
+
+    if state.cloud.is_active() {
+        match try_cloud_render(state, text, &target_mp3).await {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                warn!(
+                    text = %text,
+                    error = %e,
+                    "wm-tts: cloud render failed; falling back to piper"
+                );
+            }
+        }
+    }
+
     let synth = Arc::clone(&state.synth);
     let text_owned = text.to_string();
-    let target_inner = target.clone();
+    let target_inner = target_wav.clone();
     let res =
         tokio::task::spawn_blocking(move || synth.render(&voice, &text_owned, &target_inner)).await;
     match res {
-        Ok(Ok(())) => Ok(target),
+        Ok(Ok(())) => Ok(target_wav),
         Ok(Err(SynthError::Io { source, path })) => Err((
             "io".to_string(),
             format!("synth io on {}: {source}", path.display()),
@@ -165,21 +212,59 @@ async fn render_on_demand(state: &DaemonState, text: &str) -> Result<PathBuf, (S
     }
 }
 
-/// Spawn a playback subprocess for the WAV at `wav`. `pw-cat` needs the
-/// `--playback` flag; `paplay` takes the file as a positional arg. Both
-/// shapes are detected from the binary name suffix.
-fn spawn_player(player_bin: &str, wav: &Path) -> Result<Child> {
-    let mut cmd = Command::new(player_bin);
-    if player_bin == "pw-cat" || player_bin.ends_with("/pw-cat") {
-        cmd.arg("--playback").arg(wav);
-    } else {
-        cmd.arg(wav);
+/// Issue the cloud render and persist bytes to `target_mp3`. Returns
+/// the path on success so callers can hand it to [`spawn_player`].
+async fn try_cloud_render(
+    state: &DaemonState,
+    text: &str,
+    target_mp3: &Path,
+) -> Result<PathBuf, CloudError> {
+    let bytes = state.cloud.render(text).await?;
+    if let Err(e) = std::fs::write(target_mp3, &bytes) {
+        return Err(CloudError::Http(format!(
+            "writing cloud audio to {}: {e}",
+            target_mp3.display()
+        )));
     }
+    Ok(target_mp3.to_path_buf())
+}
+
+/// Build the argv (after the binary name) to play `audio` with
+/// `player_bin`. Extracted so tests can assert pw-cat gets
+/// `--media-type=audio/mpeg` for MP3 cloud renders without forking a
+/// process. See [`spawn_player`].
+fn player_args(player_bin: &str, audio: &Path) -> Vec<OsString> {
+    let is_pw_cat = player_bin == "pw-cat" || player_bin.ends_with("/pw-cat");
+    let is_mp3 = audio
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp3"));
+    let mut args: Vec<OsString> = Vec::new();
+    if is_pw_cat {
+        args.push("--playback".into());
+        if is_mp3 {
+            args.push("--media-type".into());
+            args.push("audio/mpeg".into());
+        }
+    }
+    args.push(audio.as_os_str().to_os_string());
+    args
+}
+
+/// Spawn a playback subprocess for the audio file at `audio`.
+/// `pw-cat` needs the `--playback` flag; `paplay` takes the file as a
+/// positional arg. Both shapes are detected from the binary name
+/// suffix. iter-8: MP3 files (produced by the cloud backend) require
+/// `--media-type=audio/mpeg` for pw-cat — without it pw-cat would
+/// treat the MP3 bytes as raw PCM and emit silence or noise.
+fn spawn_player(player_bin: &str, audio: &Path) -> Result<Child> {
+    let mut cmd = Command::new(player_bin);
+    cmd.args(player_args(player_bin, audio));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     cmd.spawn()
-        .with_context(|| format!("spawn {player_bin} {}", wav.display()))
+        .with_context(|| format!("spawn {player_bin} {}", audio.display()))
 }
 
 /// Handle a `wm.tts.speak` request. Publishes `start` + `end` on cache
@@ -658,6 +743,111 @@ mod tests {
     #[test]
     fn default_player_is_pw_cat() {
         assert_eq!(DEFAULT_PLAYER, "pw-cat");
+    }
+
+    #[test]
+    fn player_args_wav_pw_cat() {
+        let args = player_args("pw-cat", Path::new("/tmp/x.wav"));
+        let owned: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(owned, vec!["--playback", "/tmp/x.wav"]);
+    }
+
+    #[test]
+    fn player_args_mp3_pw_cat_sets_media_type() {
+        let args = player_args("pw-cat", Path::new("/tmp/x.mp3"));
+        let owned: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            owned,
+            vec!["--playback", "--media-type", "audio/mpeg", "/tmp/x.mp3"]
+        );
+    }
+
+    #[test]
+    fn player_args_paplay_unchanged_for_mp3() {
+        let args = player_args("paplay", Path::new("/tmp/x.mp3"));
+        let owned: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        // paplay doesn't speak --media-type; rely on libsndfile/ffmpeg
+        // sniffing (paplay handles MP3 via PA in practice). Keep the
+        // call simple — positional file only.
+        assert_eq!(owned, vec!["/tmp/x.mp3"]);
+    }
+
+    /// Stub backend that reports active and always errors. Used to
+    /// verify `render_on_demand` (via `handle_speak`) attempts the
+    /// cloud path AND falls through to Piper on failure (AC6).
+    #[derive(Default, Clone)]
+    struct ErroringCloud {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cloud::CloudSynth for ErroringCloud {
+        async fn render(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<bytes::Bytes, crate::cloud::CloudError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::cloud::CloudError::Http("forced".into()))
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    fn tmp_state_with_cloud(
+        cloud: Arc<dyn crate::cloud::CloudSynth>,
+    ) -> (DaemonState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = TtsConfig {
+            voice: "test-voice".into(),
+            cache_root: dir.path().to_path_buf(),
+            cloud_quality: true,
+        };
+        let state = DaemonState::with_cloud(&cfg, Vec::new(), cloud);
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn cloud_failure_falls_back_to_piper_then_publishes_error() {
+        // Cloud is active but always errors. Piper subprocess isn't
+        // available in the test environment, so the fallback ultimately
+        // publishes a render error — but the cloud must be tried first.
+        let cloud = Arc::new(ErroringCloud::default());
+        let counter = Arc::clone(&cloud.calls);
+        let (state, _g) = tmp_state_with_cloud(cloud);
+        let mut sink = MemSink::default();
+        let req = SpeakRequest {
+            text: "uncached cloud-fallback phrase".into(),
+            priority: None,
+            cancel_previous: false,
+        };
+        handle_speak(&state, &mut sink, &req)
+            .await
+            .expect("speak handler ok");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cloud backend must be invoked exactly once before fallback"
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, outgoing::START);
+        assert_eq!(events[1].0, outgoing::ERROR);
+        let err: ErrorEvent =
+            serde_json::from_value(events[1].1.clone()).expect("error decodes");
+        // Piper isn't installed in test env, so the fallback failed
+        // — but that confirms the fallback path was taken.
+        assert_eq!(err.kind, "render");
     }
 
     #[tokio::test]
