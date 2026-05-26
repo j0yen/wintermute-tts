@@ -12,6 +12,7 @@
 pub mod bus;
 pub mod cache;
 pub mod cloud;
+pub mod cloud_ws;
 pub mod daemon;
 pub mod synth;
 

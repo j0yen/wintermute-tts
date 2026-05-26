@@ -60,8 +60,10 @@ path = "src/main.rs"
 agorabus = { path = "../agorabus" }
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -69,6 +71,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
