@@ -15,6 +15,7 @@ pub mod cloud;
 pub mod cloud_ws;
 pub mod daemon;
 pub mod synth;
+pub mod voicepack;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
