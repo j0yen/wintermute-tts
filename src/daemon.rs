@@ -18,8 +18,13 @@
 //! Cancel is wired with a `oneshot::Sender<()>` stored in
 //! [`DaemonState`]: `wm.tts.cancel` fires the channel, which interrupts
 //! the playback `tokio::select!` and `SIGKILL`s the player subprocess.
-//! `drained_ms` is reported as `0` until a future iter measures real
-//! playback position via a `PipeWire`-rs streaming consumer.
+//! iter-13 approximates `drained_ms` as the wall-clock elapsed since
+//! [`install_cancel_slot`] recorded the playback start (i.e. since the
+//! player subprocess spawn). This is an upper bound on actual drained
+//! audio — the kernel/`PipeWire` buffer hasn't necessarily played
+//! everything we wrote yet — but it's strictly more useful than the
+//! previous unconditional `0`. A future iter measuring real playback
+//! position via a `PipeWire`-rs streaming consumer will tighten this.
 //!
 //! iter-11 wires the cloud streaming fast path: when
 //! [`DaemonState::cloud`] is active, cache misses skip the file-based
@@ -86,6 +91,11 @@ pub struct DaemonState {
     /// `handle_speak` is awaiting playback; `handle_cancel` `take()`s it
     /// and `send(())`s to interrupt.
     pub cancel_signal: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Wall-clock instant at which the active utterance's player
+    /// subprocess was spawned. `Some` while playback is in flight,
+    /// `None` otherwise. Used by `handle_cancel` to compute
+    /// `drained_ms` as `elapsed_since(spawn)`. See module doc.
+    pub playback_started_at: Arc<Mutex<Option<Instant>>>,
     /// Player binary name (e.g. `pw-cat`, `paplay`).
     pub player_bin: String,
     /// Synthesis backend used to render cache misses on demand.
@@ -132,6 +142,7 @@ impl DaemonState {
         Self {
             active: RwLock::new(active),
             cancel_signal: Arc::new(Mutex::new(None)),
+            playback_started_at: Arc::new(Mutex::new(None)),
             player_bin: player_from_env(),
             synth: Arc::new(PiperSubprocess::from_env()),
             cloud,
@@ -512,6 +523,9 @@ async fn install_cancel_slot(state: &DaemonState) -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel::<()>();
     let mut guard = state.cancel_signal.lock().await;
     *guard = Some(tx);
+    drop(guard);
+    let mut started = state.playback_started_at.lock().await;
+    *started = Some(Instant::now());
     rx
 }
 
@@ -519,6 +533,9 @@ async fn install_cancel_slot(state: &DaemonState) -> oneshot::Receiver<()> {
 async fn clear_cancel_slot(state: &DaemonState) {
     let mut guard = state.cancel_signal.lock().await;
     *guard = None;
+    drop(guard);
+    let mut started = state.playback_started_at.lock().await;
+    *started = None;
 }
 
 /// Play an existing WAV/MP3 file with the daemon's player binary,
@@ -583,8 +600,8 @@ async fn piper_fallback(
 
 /// Handle a `wm.tts.cancel` request. Fires the cancel channel of the
 /// active utterance (if any) and publishes `wm.tts.cancel.ack`.
-/// `drained_ms` is always `0` in iter-5 — real measurement requires
-/// iter-6 `PipeWire` streaming.
+/// `drained_ms` is the wall-clock elapsed since playback start (see
+/// module doc on the approximation); `0` when no utterance is active.
 async fn handle_cancel(state: &DaemonState, publish: &mut dyn EventSink) -> Result<()> {
     let taken = {
         let mut guard = state.cancel_signal.lock().await;
@@ -593,9 +610,13 @@ async fn handle_cancel(state: &DaemonState, publish: &mut dyn EventSink) -> Resu
     if let Some(tx) = taken {
         let _ = tx.send(());
     }
+    let drained_ms = {
+        let started = state.playback_started_at.lock().await;
+        started.map_or(0, |t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+    };
     let ack = CancelAckEvent {
         ts: now_unix_ms(),
-        drained_ms: 0,
+        drained_ms,
     };
     publish
         .publish(outgoing::CANCEL_ACK, serde_json::to_value(&ack)?)
@@ -850,6 +871,28 @@ mod tests {
         let parsed: CancelAckEvent =
             serde_json::from_value(events[0].1.clone()).expect("ack decodes");
         assert_eq!(parsed.drained_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_drained_ms_reflects_playback_elapsed() {
+        let (state, _g) = tmp_state();
+        let _rx = install_cancel_slot(&state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut sink = MemSink::default();
+        handle_cancel(&state, &mut sink).await.expect("cancel ok");
+        let events = sink.events.lock().unwrap();
+        let parsed: CancelAckEvent =
+            serde_json::from_value(events[0].1.clone()).expect("ack decodes");
+        assert!(
+            parsed.drained_ms >= 15,
+            "drained_ms should reflect ~20ms wait, got {}",
+            parsed.drained_ms
+        );
+        assert!(
+            parsed.drained_ms < 5_000,
+            "drained_ms should be a sane elapsed, got {}",
+            parsed.drained_ms
+        );
     }
 
     #[tokio::test]
