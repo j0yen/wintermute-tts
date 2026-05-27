@@ -23,8 +23,14 @@
 //! player subprocess spawn). This is an upper bound on actual drained
 //! audio — the kernel/`PipeWire` buffer hasn't necessarily played
 //! everything we wrote yet — but it's strictly more useful than the
-//! previous unconditional `0`. A future iter measuring real playback
-//! position via a `PipeWire`-rs streaming consumer will tighten this.
+//! previous unconditional `0`. iter-17 tightens that bound for
+//! file-based plays (cache hit + Piper cache miss) by capping the
+//! elapsed-since-spawn value at the WAV's declared duration (parsed
+//! from the header via [`crate::wav::parse_duration_ms`]). Cloud
+//! streaming retains the elapsed-only bound because MP3 frame length
+//! isn't known up-front. A future iter measuring real playback
+//! position via a `PipeWire`-rs streaming consumer will tighten this
+//! further.
 //!
 //! iter-11 wires the cloud streaming fast path: when
 //! [`DaemonState::cloud`] is active, cache misses skip the file-based
@@ -96,6 +102,12 @@ pub struct DaemonState {
     /// `None` otherwise. Used by `handle_cancel` to compute
     /// `drained_ms` as `elapsed_since(spawn)`. See module doc.
     pub playback_started_at: Arc<Mutex<Option<Instant>>>,
+    /// Declared audio length of the in-flight utterance, in ms.
+    /// `Some` when the playback source has a known length (cache hit
+    /// or Piper-rendered WAV), `None` for cloud MP3 streams where the
+    /// total length isn't known up-front. `handle_cancel` uses this
+    /// to cap `drained_ms` at the audio length (iter-17).
+    pub audio_duration_ms: Arc<Mutex<Option<u64>>>,
     /// Player binary name (e.g. `pw-cat`, `paplay`).
     pub player_bin: String,
     /// Synthesis backend used to render cache misses on demand.
@@ -143,6 +155,7 @@ impl DaemonState {
             active: RwLock::new(active),
             cancel_signal: Arc::new(Mutex::new(None)),
             playback_started_at: Arc::new(Mutex::new(None)),
+            audio_duration_ms: Arc::new(Mutex::new(None)),
             player_bin: player_from_env(),
             synth: Arc::new(PiperSubprocess::from_env()),
             cloud,
@@ -458,8 +471,9 @@ async fn handle_speak(
         play_file_with_cancel(state, &wav).await
     } else if state.cloud.is_active() {
         // Streaming-first: install cancel BEFORE calling cloud so a
-        // cancel arriving mid-handshake interrupts the pump.
-        let cancel_rx = install_cancel_slot(state).await;
+        // cancel arriving mid-handshake interrupts the pump. MP3 frame
+        // length isn't known up-front, so no duration cap.
+        let cancel_rx = install_cancel_slot(state, None).await;
         let outcome = try_cloud_stream_play(state, cancel_rx, &req.text).await;
         match outcome {
             StreamOutcome::Played { cancelled, .. } => {
@@ -518,14 +532,22 @@ async fn handle_speak(
 /// Install a fresh cancel channel into [`DaemonState::cancel_signal`]
 /// and return the receiver. Overwrites any prior slot (the prior
 /// utterance has already raced its cancel and would have cleared on
-/// completion).
-async fn install_cancel_slot(state: &DaemonState) -> oneshot::Receiver<()> {
+/// completion). `audio_duration_ms` is the known length of the audio
+/// the caller is about to play; `Some` for file-based plays where the
+/// WAV header is parsed up-front, `None` for cloud MP3 streams.
+async fn install_cancel_slot(
+    state: &DaemonState,
+    audio_duration_ms: Option<u64>,
+) -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel::<()>();
     let mut guard = state.cancel_signal.lock().await;
     *guard = Some(tx);
     drop(guard);
     let mut started = state.playback_started_at.lock().await;
     *started = Some(Instant::now());
+    drop(started);
+    let mut dur = state.audio_duration_ms.lock().await;
+    *dur = audio_duration_ms;
     rx
 }
 
@@ -536,13 +558,19 @@ async fn clear_cancel_slot(state: &DaemonState) {
     drop(guard);
     let mut started = state.playback_started_at.lock().await;
     *started = None;
+    drop(started);
+    let mut dur = state.audio_duration_ms.lock().await;
+    *dur = None;
 }
 
 /// Play an existing WAV/MP3 file with the daemon's player binary,
 /// racing playback completion against cancel. Returns `true` iff
-/// cancellation interrupted playback.
+/// cancellation interrupted playback. WAV duration is parsed from the
+/// header (best-effort) and used to cap `drained_ms` on cancel; an
+/// unparseable header silently falls back to elapsed-only bound.
 async fn play_file_with_cancel(state: &DaemonState, wav: &Path) -> bool {
-    let cancel_rx = install_cancel_slot(state).await;
+    let duration_ms = crate::wav::parse_duration_ms(wav).ok();
+    let cancel_rx = install_cancel_slot(state, duration_ms).await;
     let mut child = match spawn_player(&state.player_bin, wav) {
         Ok(c) => c,
         Err(e) => {
@@ -612,7 +640,12 @@ async fn handle_cancel(state: &DaemonState, publish: &mut dyn EventSink) -> Resu
     }
     let drained_ms = {
         let started = state.playback_started_at.lock().await;
-        started.map_or(0, |t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+        let started_at = *started;
+        drop(started);
+        let duration = *state.audio_duration_ms.lock().await;
+        let elapsed = started_at
+            .map_or(0, |t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+        duration.map_or(elapsed, |d| elapsed.min(d))
     };
     let ack = CancelAckEvent {
         ts: now_unix_ms(),
@@ -876,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_drained_ms_reflects_playback_elapsed() {
         let (state, _g) = tmp_state();
-        let _rx = install_cancel_slot(&state).await;
+        let _rx = install_cancel_slot(&state, None).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut sink = MemSink::default();
         handle_cancel(&state, &mut sink).await.expect("cancel ok");
@@ -891,6 +924,46 @@ mod tests {
         assert!(
             parsed.drained_ms < 5_000,
             "drained_ms should be a sane elapsed, got {}",
+            parsed.drained_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_drained_ms_capped_by_audio_duration() {
+        // iter-17: install_cancel_slot with a known 10ms audio length,
+        // then sleep 60ms — elapsed >> declared length. drained_ms
+        // must be capped at the declared length, not wall-clock.
+        let (state, _g) = tmp_state();
+        let _rx = install_cancel_slot(&state, Some(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let mut sink = MemSink::default();
+        handle_cancel(&state, &mut sink).await.expect("cancel ok");
+        let events = sink.events.lock().unwrap();
+        let parsed: CancelAckEvent =
+            serde_json::from_value(events[0].1.clone()).expect("ack decodes");
+        assert_eq!(
+            parsed.drained_ms, 10,
+            "drained_ms should be capped at audio length, got {}",
+            parsed.drained_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_drained_ms_uses_elapsed_when_under_duration() {
+        // Sleep 20ms with a generous 5_000ms declared length — the cap
+        // should NOT clamp to the wall-clock value (i.e. the min picks
+        // elapsed, not duration).
+        let (state, _g) = tmp_state();
+        let _rx = install_cancel_slot(&state, Some(5_000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut sink = MemSink::default();
+        handle_cancel(&state, &mut sink).await.expect("cancel ok");
+        let events = sink.events.lock().unwrap();
+        let parsed: CancelAckEvent =
+            serde_json::from_value(events[0].1.clone()).expect("ack decodes");
+        assert!(
+            (15..200).contains(&parsed.drained_ms),
+            "drained_ms should reflect ~20ms elapsed (not the 5000ms cap), got {}",
             parsed.drained_ms
         );
     }
