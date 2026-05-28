@@ -816,12 +816,28 @@ pub async fn run(cache_config: &Path) -> Result<()> {
         warn!(socket = %sock.display(), "wm-tts: agorabus not reachable; exiting");
         return Ok(());
     };
+    sub_client
+        .announce(
+            &format!("wm-tts-{}-sub", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-tts control subscribe",
+        )
+        .await?;
     sub_client.subscribe(bus::TOPIC_PREFIX).await?;
     info!(prefix = bus::TOPIC_PREFIX, "wm-tts: subscribed");
 
     // Separate connection for publishing — read/write on a subscribed
     // socket would interleave Reply lines with the broadcast stream.
-    let pub_client = agorabus::Client::connect(&sock).await?;
+    let mut pub_client = agorabus::Client::connect(&sock).await?;
+    pub_client
+        .announce(
+            &format!("wm-tts-{}", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-tts publish path",
+        )
+        .await?;
     let mut sink = AgoraSink { inner: pub_client };
 
     // Dispatch loop. Each event runs to completion before the next is
