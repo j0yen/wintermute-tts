@@ -33,20 +33,23 @@ pub mod outgoing {
     /// Acknowledgement of a successful voice hot-swap.
     pub const RELOAD_ACK: &str = "wm.tts.reload.ack";
 
-    /// All outbound topics this daemon publishes. Used by the dispatch
-    /// loop to silently skip events whose topic matches one of our own
-    /// publishes — without this filter, the broadcast bus echoes our
-    /// `wm.tts.error` back to us, `decode_request` rejects it as
-    /// `UnknownTopic`, we publish another `wm.tts.error` describing the
-    /// rejection, the bus echoes it back, and the cycle saturates the
-    /// daemon. See PRD-wintermute-tts-error-loop-suppress.
+    /// All outbound topics this daemon publishes.
+    ///
+    /// Used by the dispatch loop to silently skip events whose topic
+    /// matches one of our own publishes. Without this filter, the
+    /// broadcast bus echoes our `wm.tts.error` back to us,
+    /// `decode_request` rejects it as `UnknownTopic`, we publish
+    /// another `wm.tts.error` describing the rejection, the bus echoes
+    /// it back, and the cycle saturates the daemon. See
+    /// PRD-wintermute-tts-error-loop-suppress.
     pub const ALL: &[&str] = &[START, CANCEL_ACK, END, ERROR, RELOAD_ACK];
 }
 
-/// Returns `true` iff `topic` is one of the daemon's own outbound
-/// topics ([`outgoing::ALL`]). The dispatch loop uses this to silently
-/// skip echoes of its own publishes. See [`outgoing::ALL`] for the
-/// loop pathology this guards against.
+/// Returns `true` iff `topic` is one of the daemon's own outbound topics.
+///
+/// Backed by [`outgoing::ALL`]. The dispatch loop uses this to silently
+/// skip echoes of its own publishes. See [`outgoing::ALL`] for the loop
+/// pathology this guards against.
 #[must_use]
 pub fn is_self_emitted_topic(topic: &str) -> bool {
     outgoing::ALL.contains(&topic)
