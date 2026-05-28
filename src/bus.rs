@@ -32,6 +32,24 @@ pub mod outgoing {
     pub const ERROR: &str = "wm.tts.error";
     /// Acknowledgement of a successful voice hot-swap.
     pub const RELOAD_ACK: &str = "wm.tts.reload.ack";
+
+    /// All outbound topics this daemon publishes. Used by the dispatch
+    /// loop to silently skip events whose topic matches one of our own
+    /// publishes — without this filter, the broadcast bus echoes our
+    /// `wm.tts.error` back to us, `decode_request` rejects it as
+    /// `UnknownTopic`, we publish another `wm.tts.error` describing the
+    /// rejection, the bus echoes it back, and the cycle saturates the
+    /// daemon. See PRD-wintermute-tts-error-loop-suppress.
+    pub const ALL: &[&str] = &[START, CANCEL_ACK, END, ERROR, RELOAD_ACK];
+}
+
+/// Returns `true` iff `topic` is one of the daemon's own outbound
+/// topics ([`outgoing::ALL`]). The dispatch loop uses this to silently
+/// skip echoes of its own publishes. See [`outgoing::ALL`] for the
+/// loop pathology this guards against.
+#[must_use]
+pub fn is_self_emitted_topic(topic: &str) -> bool {
+    outgoing::ALL.contains(&topic)
 }
 
 /// Decoded request payloads. Returned by [`decode_request`].
@@ -299,5 +317,59 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = now_unix_ms();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn outgoing_all_lists_every_outbound_topic() {
+        // Every const in `outgoing` must appear in `ALL`; the
+        // self-emitted filter relies on that exhaustiveness to break
+        // the wm.tts.error feedback loop. If you add a new outbound
+        // topic, add it to `outgoing::ALL` and extend this assertion.
+        let expected = [
+            outgoing::START,
+            outgoing::CANCEL_ACK,
+            outgoing::END,
+            outgoing::ERROR,
+            outgoing::RELOAD_ACK,
+        ];
+        for t in expected {
+            assert!(
+                outgoing::ALL.contains(&t),
+                "outgoing::ALL is missing {t}"
+            );
+        }
+        assert_eq!(outgoing::ALL.len(), expected.len());
+    }
+
+    #[test]
+    fn is_self_emitted_topic_flags_every_outbound() {
+        // The dispatch-side filter relies on this for every topic the
+        // daemon publishes — especially `wm.tts.error`, which is the
+        // recursive amplifier.
+        assert!(is_self_emitted_topic(outgoing::ERROR));
+        assert!(is_self_emitted_topic(outgoing::START));
+        assert!(is_self_emitted_topic(outgoing::END));
+        assert!(is_self_emitted_topic(outgoing::CANCEL_ACK));
+        assert!(is_self_emitted_topic(outgoing::RELOAD_ACK));
+    }
+
+    #[test]
+    fn is_self_emitted_topic_does_not_flag_inbound() {
+        // Inbound requests must NOT be filtered — the filter is only
+        // for echoes of our own publishes.
+        assert!(!is_self_emitted_topic(incoming::SPEAK));
+        assert!(!is_self_emitted_topic(incoming::CANCEL));
+        assert!(!is_self_emitted_topic(incoming::RELOAD_VOICE));
+    }
+
+    #[test]
+    fn is_self_emitted_topic_does_not_flag_unrelated() {
+        // Other wm.* topics aren't ours and shouldn't be filtered.
+        assert!(!is_self_emitted_topic("wm.audio.speech.start"));
+        assert!(!is_self_emitted_topic("wm.dialog.turn"));
+        assert!(!is_self_emitted_topic(""));
+        // Substring near-misses must NOT match — we filter on equality.
+        assert!(!is_self_emitted_topic("wm.tts.error.detail"));
+        assert!(!is_self_emitted_topic("wm.tts.err"));
     }
 }

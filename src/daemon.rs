@@ -738,14 +738,24 @@ pub trait EventSink: Send {
 }
 
 /// Production sink: publishes through an agorabus [`agorabus::Client`].
+///
+/// The client is wrapped in an `Arc<tokio::sync::Mutex<_>>` so a
+/// background heartbeat task (spawned in [`run`]) can periodically
+/// refresh the daemon's `last_heartbeat_unix_secs` without contending
+/// destructively with publish call sites. Publish is the hot path; the
+/// lock is held only for the duration of one request+reply round-trip
+/// (microseconds), so contention is negligible.
 pub struct AgoraSink {
-    pub(crate) inner: agorabus::Client,
+    pub(crate) inner: Arc<Mutex<agorabus::Client>>,
 }
 
 #[async_trait::async_trait]
 impl EventSink for AgoraSink {
     async fn publish(&mut self, topic: &str, data: Value) -> Result<()> {
-        let reply = self.inner.publish(topic, data).await?;
+        let reply = {
+            let mut client = self.inner.lock().await;
+            client.publish(topic, data).await?
+        };
         if !reply.ok {
             warn!(
                 topic = %topic,
@@ -783,6 +793,7 @@ pub async fn dispatch(
 ///
 /// Propagates I/O failures from config loading or the agorabus client.
 /// Per-phrase cache-render failures are logged and do not abort startup.
+#[allow(clippy::too_many_lines)]
 pub async fn run(cache_config: &Path) -> Result<()> {
     let cfg = TtsConfig::default();
     let cache_phrases = load_cache_yaml(cache_config)
@@ -844,14 +855,93 @@ pub async fn run(cache_config: &Path) -> Result<()> {
             "wm-tts publish path",
         )
         .await?;
-    let mut sink = AgoraSink { inner: pub_client };
+    let pub_arc = Arc::new(Mutex::new(pub_client));
+    let mut sink = AgoraSink {
+        inner: Arc::clone(&pub_arc),
+    };
+
+    // Heartbeat keepalive — the bus daemon prunes peers from its
+    // `peers` snapshot when `last_heartbeat_unix_secs` ages past
+    // `DEFAULT_HEARTBEAT_TIMEOUT_SECS` (60s). Both the publish-owner
+    // session (`wm-tts-{pid}`) and the subscribe-owner session
+    // (`wm-tts-{pid}-sub`) need their own ticker, since each connection
+    // owns a distinct peer record keyed by session_id. See PRD
+    // wintermute-fleet-bus-heartbeat-keepalive §4.
+    let hb_interval = std::time::Duration::from_secs(
+        agorabus::DEFAULT_HEARTBEAT_TIMEOUT_SECS / 2,
+    );
+    let pub_hb_arc = Arc::clone(&pub_arc);
+    let _pub_hb_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(hb_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            let mut client = pub_hb_arc.lock().await;
+            if let Err(e) = client.heartbeat("wm-tts").await {
+                warn!(error = %e, "wm-tts: pub heartbeat failed; bus likely gone");
+                return;
+            }
+        }
+    });
+
+    // Split the sub_client into halves so the heartbeat ticker shares
+    // the wire with the InboundLine reader loop. Heartbeat replies that
+    // arrive on this wire are filtered by the `InboundLine` match
+    // below (the same shape `Client::next_event` uses internally).
+    let (mut sub_write, mut sub_reader) = sub_client.into_halves();
+    let _sub_hb_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(hb_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            if let Err(e) = agorabus::client::send_heartbeat(&mut sub_write, "wm-tts").await {
+                warn!(error = %e, "wm-tts: sub heartbeat failed; bus likely gone");
+                return;
+            }
+        }
+    });
 
     // Dispatch loop. Each event runs to completion before the next is
     // read — barge-in already works because cancel arrives on a separate
     // connection's broadcast and the cancel handler is a *fast* path
     // (sends through the oneshot, returns). iter-6 will hoist
     // `handle_speak` into a spawned task so the loop can race many.
-    while let Some(ev) = sub_client.next_event().await? {
+    //
+    // Replaces the previous `sub_client.next_event()` loop with the
+    // equivalent manual InboundLine reader so the heartbeat ticker
+    // above can share the wire with us (next_event takes &mut self on
+    // the whole Client, which a spawned task cannot reach).
+    loop {
+        let line = match sub_reader.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(err) => {
+                error!(error = %err, "wm-tts: subscribe wire read failed");
+                break;
+            }
+        };
+        let parsed: agorabus::client::InboundLine = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, line = %line, "wm-tts: undecodable bus line; skipping");
+                continue;
+            }
+        };
+        let ev = match parsed {
+            agorabus::client::InboundLine::Reply(_) => continue,
+            agorabus::client::InboundLine::Event(ev) => ev,
+        };
+        // Silently drop echoes of our own publishes — the agorabus
+        // subscribe prefix `wm.tts.` captures both incoming requests
+        // (`wm.tts.speak`, …) and our own outbound events
+        // (`wm.tts.error`, `wm.tts.start`, …). Without this filter,
+        // every `wm.tts.error` we publish gets broadcast back, fails
+        // `decode_request` as `UnknownTopic`, and we publish another
+        // `wm.tts.error` describing the decode failure — a recursive
+        // storm. See PRD-wintermute-tts-error-loop-suppress.
+        if bus::is_self_emitted_topic(&ev.topic) {
+            continue;
+        }
         match decode_request(&ev.topic, &ev.data) {
             Ok(req) => {
                 if let Err(err) = dispatch(&state, &mut sink, req).await {
@@ -1350,5 +1440,44 @@ mod tests {
             Some(wav.clone())
         );
         assert_eq!(cache_hit_path(&active.cache, "nope"), None);
+    }
+
+    /// Regression: the dispatch loop must silently drop events whose
+    /// topic is one of our own publishes — otherwise a `publish_error`
+    /// call triggers a broadcast echo, the echo fails `decode_request`
+    /// as `UnknownTopic`, we publish another error, and the loop
+    /// saturates the daemon (37k log lines in 30s observed pre-fix).
+    /// The filter lives in `run`'s loop and is keyed by
+    /// `bus::is_self_emitted_topic`; this test pins that every outbound
+    /// topic is covered so a future outbound topic added to
+    /// `bus::outgoing` is forced to also extend the filter.
+    #[test]
+    fn self_emitted_filter_covers_every_outbound_topic() {
+        // handle_speak / handle_cancel / handle_reload_voice publish
+        // onto these topics. Each one MUST be filtered by the dispatch
+        // loop when received as an inbound echo.
+        for topic in [
+            outgoing::START,
+            outgoing::END,
+            outgoing::ERROR,
+            outgoing::CANCEL_ACK,
+            outgoing::RELOAD_ACK,
+        ] {
+            assert!(
+                crate::bus::is_self_emitted_topic(topic),
+                "outbound topic {topic} would slip past the dispatch filter and re-enter decode — recursive storm"
+            );
+        }
+        // Inbound request topics must still pass through.
+        for topic in [
+            crate::bus::incoming::SPEAK,
+            crate::bus::incoming::CANCEL,
+            crate::bus::incoming::RELOAD_VOICE,
+        ] {
+            assert!(
+                !crate::bus::is_self_emitted_topic(topic),
+                "inbound topic {topic} would be silently dropped — daemon would go deaf"
+            );
+        }
     }
 }
