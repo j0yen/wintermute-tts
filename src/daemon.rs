@@ -810,8 +810,14 @@ pub async fn run(cache_config: &Path) -> Result<()> {
     }
 
     // Connect to agorabus. Fail-open: if the bus isn't running, log and
-    // exit so the systemd unit restarts us when it comes back.
-    let sock = agorabus::default_socket_path();
+    // exit so the systemd unit restarts us when it comes back. The
+    // `WM_TTS_BUS_SOCKET` override mirrors the `WM_TTS_VOICE`/
+    // `WM_TTS_PLAYER`/`WM_TTS_CACHE_ROOT` env idiom and lets
+    // `tests/bus_smoke.rs` point the daemon at a per-test temp socket
+    // without touching `$HOME`.
+    let sock = std::env::var("WM_TTS_BUS_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| agorabus::default_socket_path());
     let Some(mut sub_client) = agorabus::Client::try_connect(&sock).await? else {
         warn!(socket = %sock.display(), "wm-tts: agorabus not reachable; exiting");
         return Ok(());
