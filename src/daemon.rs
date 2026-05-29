@@ -1091,16 +1091,25 @@ pub async fn run(cache_config: &Path) -> Result<()> {
         }
     });
 
-    // Dispatch loop. Each event runs to completion before the next is
-    // read — barge-in already works because cancel arrives on a separate
-    // connection's broadcast and the cancel handler is a *fast* path
-    // (sends through the oneshot, returns). iter-6 will hoist
-    // `handle_speak` into a spawned task so the loop can race many.
+    // Dispatch loop. `wm.tts.speak` is hoisted into a spawned task so
+    // a subsequent `wm.tts.cancel` arriving on the same subscription
+    // wire can be read and dispatched WHILE the player is mid-play.
+    // PRD-pipewire-output AC5 requires the cancel SIGKILL the pw-cat
+    // subprocess within 200ms of publication; the previous
+    // single-threaded loop blocked at `dispatch(...).await` until the
+    // play completed, so `wm.tts.cancel` arrived only after the audio
+    // had finished naturally. The shared mutable state (cancel slot,
+    // active voice, started_at) already lives behind Arc/Mutex/RwLock,
+    // so spawning a per-speak task is a straight Arc clone.
+    //
+    // `wm.tts.cancel` and `wm.tts.reload_voice` run inline — they're
+    // fast paths that don't block the wire.
     //
     // Replaces the previous `sub_client.next_event()` loop with the
     // equivalent manual InboundLine reader so the heartbeat ticker
     // above can share the wire with us (next_event takes &mut self on
     // the whole Client, which a spawned task cannot reach).
+    let state_arc: Arc<DaemonState> = Arc::new(state);
     loop {
         let line = match sub_reader.next_line().await {
             Ok(Some(l)) => l,
@@ -1133,8 +1142,29 @@ pub async fn run(cache_config: &Path) -> Result<()> {
             continue;
         }
         match decode_request(&ev.topic, &ev.data) {
+            Ok(Request::Speak(s)) => {
+                // Spawn the playback in a detached task; the dispatch
+                // loop keeps reading so a later `wm.tts.cancel` can
+                // fire the cancel-slot oneshot mid-play.
+                let state_for_speak = Arc::clone(&state_arc);
+                let pub_arc_for_speak = Arc::clone(&pub_arc);
+                tokio::spawn(async move {
+                    let mut sink_local = AgoraSink {
+                        inner: pub_arc_for_speak,
+                    };
+                    if let Err(err) = handle_speak(&state_for_speak, &mut sink_local, &s).await {
+                        error!(err = %err, "wm-tts: spawned speak handler errored");
+                        let _ = publish_error(
+                            &mut sink_local,
+                            "bus",
+                            &format!("speak handler: {err}"),
+                        )
+                        .await;
+                    }
+                });
+            }
             Ok(req) => {
-                if let Err(err) = dispatch(&state, &mut sink, req).await {
+                if let Err(err) = dispatch(&state_arc, &mut sink, req).await {
                     error!(topic = %ev.topic, err = %err, "wm-tts: dispatch failed");
                     let _ = publish_error(&mut sink, "bus", &format!("dispatch: {err}")).await;
                 }
