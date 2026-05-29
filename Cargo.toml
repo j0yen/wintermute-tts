@@ -56,6 +56,13 @@ panic = "abort"
 name = "wm-tts"
 path = "src/main.rs"
 
+[features]
+# Opt-in gate for hardware-bound acceptance tests (see README "Hardware
+# reality verification"). Off by default so `cargo test` stays green on
+# hosts without the live Piper voice model / PipeWire playback path. Per
+# PRD-autobuilder-hardware-mock-convention AC10.
+real-hardware = []
+
 [dependencies]
 agorabus = { path = "../agorabus", version = "0.4" }
 anyhow = "1"
