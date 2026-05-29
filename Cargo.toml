@@ -57,7 +57,7 @@ name = "wm-tts"
 path = "src/main.rs"
 
 [dependencies]
-agorabus = { path = "../agorabus", version = "0.3" }
+agorabus = { path = "../agorabus", version = "0.4" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
