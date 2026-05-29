@@ -24,8 +24,14 @@ speech to the default PipeWire sink:
 |---|---|
 | `wm.tts.start` | `{text, source, ts}` |
 | `wm.tts.cancel.ack` | `{ts, drained_ms}` |
-| `wm.tts.end` | `{text, duration_ms, ts}` |
+| `wm.tts.end` | `{text, duration_ms, outcome, played_bytes, ts}` |
 | `wm.tts.error` | `{kind, message, ts}` |
+
+`wm.tts.end.outcome` is one of `"ok"`, `"cancelled"`, `"error"`;
+`played_bytes` is the WAV `data` chunk size that flowed to the sink
+(`0` on cancel/error). `wm.tts.error.kind` includes
+`"pw_cat_missing"` when the configured player binary isn't on
+`$PATH` (see [Configuration](#configuration)).
 
 Voicepack module (`wm-voicepack`) lives in this crate as `voicepack::`
 until peon-ping PRD-003 begins consuming it, at which point it factors
@@ -77,6 +83,20 @@ set `WM_CLOUD_TTS_QUALITY=true` to enable the ElevenLabs cloud path
 | `WM_CLOUD_TTS_QUALITY` | `false` | Opt-in ElevenLabs streaming |
 | `WM_TTS_VOICE_ID_CLOUD` | (unset) | ElevenLabs voice id |
 | `ELEVENLABS_API_KEY` | (unset) | ElevenLabs API key |
+| `WM_SINK_NODE` | (unset → PipeWire default) | `pw-cat --target <node>` (PipeWire sink) |
+| `WM_PW_CAT_BIN` | `pw-cat` | Override the playback binary |
+
+## Recent
+
+- **v0.2.0 (2026-05-28) — PipeWire output ships.** `wm-tts` finally
+  routes rendered audio to the configured `WM_SINK_NODE` via
+  `pw-cat --target <node>`, emits `wm.tts.end{outcome, played_bytes}`
+  envelopes, fail-soft `wm.tts.error{kind:"pw_cat_missing"}` when the
+  player isn't on `$PATH`, and fail-open to PipeWire's default sink
+  when `WM_SINK_NODE` is empty. See [PRD-wintermute-tts-pipewire-output][prd]
+  and the `v0.2.0` entry in `CHANGELOG.md`.
+
+[prd]: https://github.com/j0yen/autobuilder/blob/main/PRDs-archive/PRD-wintermute-tts-pipewire-output.md
 
 ## License
 

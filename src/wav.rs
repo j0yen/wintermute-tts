@@ -47,6 +47,57 @@ pub fn parse_duration_ms(path: &Path) -> Result<u64, WavError> {
     parse_duration_ms_bytes(&bytes)
 }
 
+/// Parse the WAV header at `path` and return the `data` chunk size
+/// in bytes.
+///
+/// This is the byte count actually streamed to the sink during a
+/// play. Drives the `played_bytes` field on `wm.tts.end` so the
+/// metric is derived from the source file rather than a self-reported
+/// player counter.
+///
+/// # Errors
+/// Same shape as [`parse_duration_ms`].
+pub fn parse_data_bytes(path: &Path) -> Result<u64, WavError> {
+    let bytes = std::fs::read(path)?;
+    parse_data_bytes_slice(&bytes)
+}
+
+/// Same as [`parse_data_bytes`] but takes an in-memory slice. Used by
+/// tests.
+///
+/// # Errors
+/// See [`parse_data_bytes`].
+pub fn parse_data_bytes_slice(bytes: &[u8]) -> Result<u64, WavError> {
+    let header = bytes.get(..12).ok_or(WavError::NotRiff)?;
+    if header.get(..4) != Some(b"RIFF") || header.get(8..12) != Some(b"WAVE") {
+        return Err(WavError::NotRiff);
+    }
+    let mut cursor: usize = 12;
+    while let Some(chunk_header) = bytes.get(cursor..cursor.saturating_add(8)) {
+        let id: [u8; 4] = chunk_header
+            .get(..4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or(WavError::TruncatedFmt)?;
+        let size_le: [u8; 4] = chunk_header
+            .get(4..8)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or(WavError::TruncatedFmt)?;
+        let size = u32::from_le_bytes(size_le);
+        if &id == b"data" {
+            return Ok(u64::from(size));
+        }
+        let size_usize = usize::try_from(size).map_err(|_| WavError::SizeOverflow)?;
+        let body_start = cursor.checked_add(8).ok_or(WavError::SizeOverflow)?;
+        let pad = u32::from(size % 2 == 1);
+        let pad_usize = usize::try_from(pad).map_err(|_| WavError::SizeOverflow)?;
+        let advance = size_usize
+            .checked_add(pad_usize)
+            .ok_or(WavError::SizeOverflow)?;
+        cursor = body_start.checked_add(advance).ok_or(WavError::SizeOverflow)?;
+    }
+    Err(WavError::MissingData)
+}
+
 /// Same as [`parse_duration_ms`] but takes an in-memory slice. Used by
 /// tests to avoid a filesystem round-trip.
 ///
@@ -115,6 +166,40 @@ pub fn parse_duration_ms_bytes(bytes: &[u8]) -> Result<u64, WavError> {
         return Err(WavError::ZeroByteRate);
     }
     Ok(u64::from(data_size).saturating_mul(1000) / u64::from(byte_rate))
+}
+
+/// Build a minimal RIFF/WAVE byte sequence with `data_bytes` of audio
+/// body, 16-bit mono PCM at 22050 Hz. Reused by daemon-module tests
+/// that need a real WAV header so `parse_data_bytes` returns the
+/// correct count without instantiating a Piper subprocess.
+#[cfg(test)]
+#[must_use]
+pub fn tests_only_minimal_wav_with_data_bytes(data_bytes: u32) -> Vec<u8> {
+    let sample_rate: u32 = 22050;
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate: u32 = sample_rate
+        * u32::from(num_channels)
+        * u32::from(bits_per_sample)
+        / 8;
+    let block_align: u16 = num_channels * bits_per_sample / 8;
+    let riff_size: u32 = 4 + (8 + 16) + (8 + data_bytes);
+    let mut buf = Vec::with_capacity(12 + 24 + 8 + data_bytes as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&riff_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&num_channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_bytes.to_le_bytes());
+    buf.extend(std::iter::repeat_n(0u8, data_bytes as usize));
+    buf
 }
 
 #[cfg(test)]
@@ -304,5 +389,65 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let ms = parse_duration_ms(&path).unwrap();
         assert_eq!(ms, 500);
+    }
+
+    #[test]
+    fn data_bytes_matches_payload_size() {
+        let bytes = build_wav(22050, 44100);
+        let n = parse_data_bytes_slice(&bytes).unwrap();
+        assert_eq!(n, 44100);
+    }
+
+    #[test]
+    fn data_bytes_handles_pre_data_padded_chunk() {
+        // Same odd-size-LIST-before-fmt fixture as the duration test,
+        // augmented with a data chunk after fmt. parse_data_bytes must
+        // skip the unknown padded chunk and report the data chunk size.
+        let sample_rate: u32 = 22050;
+        let data_bytes: usize = 22050; // 0.5s
+        let extra_size: u32 = 5;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&extra_size.to_le_bytes());
+        buf.extend_from_slice(b"abcde");
+        buf.push(0); // pad byte
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&44100u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        let data_u32 = u32::try_from(data_bytes).unwrap();
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_u32.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0u8, data_bytes));
+        let n = parse_data_bytes_slice(&buf).unwrap();
+        assert_eq!(u64::try_from(data_bytes).unwrap(), n);
+    }
+
+    #[test]
+    fn data_bytes_missing_data_chunk_errors() {
+        // RIFF/WAVE with only fmt chunk → MissingData.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(4u32 + 8 + 16).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&22050u32.to_le_bytes());
+        buf.extend_from_slice(&44100u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        assert!(matches!(
+            parse_data_bytes_slice(&buf),
+            Err(WavError::MissingData)
+        ));
     }
 }

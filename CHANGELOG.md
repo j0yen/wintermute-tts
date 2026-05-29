@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.2.0 — 2026-05-28
+
+PipeWire output: audio actually plays
+(PRD-wintermute-tts-pipewire-output).
+
+Through v0.1.3, `wm-tts` rendered Piper WAVs correctly but never sent
+the bytes to a sink — the cache-hit path spawned `pw-cat` without
+`--target`, so on a multi-sink machine the daemon was effectively
+silent unless PipeWire's default sink happened to match
+`WM_SINK_NODE`. Four source comments (`synth.rs:4`, `cache.rs:7`,
+`lib.rs:8`, `bus.rs:111`) all pointed at a planned iter-4/iter-6
+PipeWire enqueue that never landed.
+
+v0.2.0 ships the enqueue:
+
+- `WM_SINK_NODE` is now read at startup and threaded through
+  `player_args` / `streaming_player_args` as `pw-cat --target
+  <node>`. Empty / unset → omit the flag and let PipeWire route to
+  the default sink (AC9 fail-open).
+- New `WM_PW_CAT_BIN` env var (PRD spec) overrides the player
+  binary; the older `WM_TTS_PLAYER` alias is still honored.
+- `wm.tts.end` carries two new fields: `outcome` (one of `"ok"`,
+  `"cancelled"`, `"error"`) and `played_bytes` (the WAV `data`
+  chunk size on `ok`, `0` otherwise). The `bus.rs:111` "always
+  reports 0" comment is gone.
+- Missing `pw-cat` (or whatever `WM_PW_CAT_BIN` points at) now
+  publishes `wm.tts.error{kind:"pw_cat_missing"}` followed by
+  `wm.tts.end{outcome:"error"}` instead of silently warn-logging
+  (AC10 fail-soft).
+- Cancel mid-play now reports `wm.tts.end{outcome:"cancelled"}`
+  alongside the existing `wm.tts.cancel.ack`.
+- `play: started path=…` and `play: ended outcome=… dur_ms=…
+  played_bytes=…` log lines on every play attempt for AC3 / AC6
+  smoke verification.
+- Four stale iter-N planning comments removed: `synth.rs:4`,
+  `cache.rs:7`, `lib.rs:8`, `bus.rs:111`.
+
+Queue / drop policy for overlapping `wm.tts.speak` events: the
+dispatch loop awaits each play to completion before draining the
+next event, so two `speak`s arriving while one is playing serialize
+naturally — there is no parallel-play branch and no explicit drop
+policy. A future PRD (PRD-wintermute-tts-queue-policy) will surface
+an explicit knob.
+
+Non-goal: the `pipewire-rs` streaming consumer described in the
+former `lib.rs:8` comment is deferred to
+PRD-wintermute-tts-pipewire-streaming. Subprocess `pw-cat` gets
+audio to the speaker today.
+
 ## v0.1.3 — 2026-05-28
 
 Break the wm.tts.error feedback loop (PRD-wintermute-tts-error-loop-suppress).

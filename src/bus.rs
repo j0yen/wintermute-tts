@@ -107,9 +107,24 @@ pub struct StartEvent {
 pub struct CancelAckEvent {
     /// Unix milliseconds when cancel was processed.
     pub ts: u64,
-    /// Milliseconds of speech already played before cancel landed. iter-4
-    /// always reports `0` because no `PipeWire` output is wired yet.
+    /// Milliseconds of speech already played before cancel landed. The
+    /// daemon approximates this as `min(elapsed_since_spawn,
+    /// wav_declared_ms)` for file-based plays and `elapsed_since_spawn`
+    /// alone for cloud MP3 streams (length unknown up-front). A future
+    /// `PipeWire`-rs streaming consumer will report exact frame counts.
     pub drained_ms: u64,
+}
+
+/// Playback outcome values for [`EndEvent::outcome`].
+pub mod outcome {
+    /// Player exited cleanly; the utterance completed.
+    pub const OK: &str = "ok";
+    /// `wm.tts.cancel` interrupted playback mid-stream.
+    pub const CANCELLED: &str = "cancelled";
+    /// Playback failed (player non-zero exit, spawn failure, render
+    /// error). A paired `wm.tts.error` envelope carries the kind +
+    /// message.
+    pub const ERROR: &str = "error";
 }
 
 /// Outbound `wm.tts.end` payload.
@@ -117,9 +132,16 @@ pub struct CancelAckEvent {
 pub struct EndEvent {
     /// The utterance text.
     pub text: String,
-    /// Duration of the rendered audio in milliseconds. iter-4 estimates
-    /// from the WAV file size; iter-5 will report measured playback time.
+    /// Wall-clock playback span in milliseconds (player spawn → exit).
     pub duration_ms: u64,
+    /// Playback outcome: `"ok"`, `"cancelled"`, or `"error"`. See
+    /// [`outcome`].
+    pub outcome: String,
+    /// Bytes of audio sent to the sink. For WAV plays this is the
+    /// `data` chunk size from the file header; for cloud MP3 streams
+    /// it's the byte count actually written to the player's stdin
+    /// before the stream ended. `0` for `outcome != "ok"`.
+    pub played_bytes: u64,
     /// Unix milliseconds when the utterance completed.
     pub ts: u64,
 }

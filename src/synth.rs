@@ -1,8 +1,9 @@
 //! Synthesis backends — adapt different TTS engines to a single trait.
 //!
-//! `iter-3` introduces the subprocess `piper` backend. Streaming
-//! `PipeWire` enqueue + barge-in cancel land in `iter-4` alongside the
-//! agorabus subscribe loop.
+//! The default backend is the upstream `piper` CLI, invoked as a
+//! subprocess: `piper --model <voice>.onnx --output_file <out.wav>`
+//! with the text on stdin. `PipeWire` playback of the rendered file
+//! lives in [`crate::daemon`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

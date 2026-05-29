@@ -3,8 +3,8 @@
 //! At startup, `wm-tts` walks the configured phrase list, looks up the
 //! voice-keyed cache directory, and renders any phrase that does not
 //! already have a `.wav` on disk. Subsequent `wm.tts.speak` requests
-//! whose text exactly matches a cached phrase resolve in <50 ms (PRD
-//! AC3) — just a `PipeWire` enqueue of the file.
+//! whose text exactly matches a cached phrase resolve quickly via the
+//! `pw-cat` playback subprocess wired in [`crate::daemon`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -86,13 +86,17 @@ impl CacheManager {
     }
 
     fn entry_path_with_ext(&self, phrase: &str, ext: &str) -> PathBuf {
+        use std::fmt::Write as _;
         let normalized = phrase.trim().to_lowercase();
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
         let digest = hasher.finalize();
         let mut name = String::with_capacity(20);
         for byte in digest.iter().take(8) {
-            name.push_str(&format!("{byte:02x}"));
+            // `write!` on `String` is infallible; the `unwrap` here
+            // would never fire, so silence the lint instead of
+            // poking a panic source into a hot path.
+            let _ = write!(name, "{byte:02x}");
         }
         name.push('.');
         name.push_str(ext);
