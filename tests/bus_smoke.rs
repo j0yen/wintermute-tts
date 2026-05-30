@@ -51,6 +51,7 @@ async fn run_bus_smoke() -> Result<(), String> {
         socket_path: bus_sock.clone(),
         heartbeat_timeout: Duration::from_secs(60),
         broadcast_capacity: 1024,
+        ..DaemonConfig::defaults()
     };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (bus_shutdown_tx, bus_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

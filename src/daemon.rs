@@ -1220,6 +1220,7 @@ mod tests {
             voice: "test-voice".into(),
             cache_root: dir.path().to_path_buf(),
             cloud_quality: false,
+            voice_settings: crate::synth::VoiceConfig::default(),
         };
         let state = DaemonState::new(&cfg, phrases);
         (state, dir)
@@ -1588,6 +1589,7 @@ mod tests {
             voice: "test-voice".into(),
             cache_root: dir.path().to_path_buf(),
             cloud_quality: true,
+            voice_settings: crate::synth::VoiceConfig::default(),
         };
         let state = DaemonState::with_cloud(&cfg, Vec::new(), cloud);
         (state, dir)
@@ -1917,7 +1919,7 @@ mod tests {
         // cancel_drained_ms_reflects_playback_elapsed; this test
         // adds end-envelope-outcome=cancelled coverage when the
         // cancel fires concurrently with a real player.
-        let mut sink = MemSink::default();
+        let sink = MemSink::default();
         let req = SpeakRequest {
             text: "long".into(),
             priority: None,
