@@ -88,6 +88,11 @@ set `WM_CLOUD_TTS_QUALITY=true` to enable the ElevenLabs cloud path
 
 ## Recent
 
+- **v0.3.0 (2026-05-29) — Elder legibility: speaking-rate and gain knobs.**
+  `VoiceConfig` (speaking_rate=0.85, gain=1.20 by default) wires
+  `--length_scale` into Piper invocations and scales WAV samples
+  post-synthesis. Exposed in YAML as `[voice_settings]`. Neutral
+  rate/gain recovers today's behaviour exactly. See `CHANGELOG.md`.
 - **v0.2.0 (2026-05-28) — PipeWire output ships.** `wm-tts` finally
   routes rendered audio to the configured `WM_SINK_NODE` via
   `pw-cat --target <node>`, emits `wm.tts.end{outcome, played_bytes}`
