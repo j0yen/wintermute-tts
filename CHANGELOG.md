@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.0 — 2026-05-30
+
+Add speaking_rate knob (piper --length_scale) and output gain (WAV sample scaling) to the TTS path, with elder-friendly defaults (0.85x rate, 1.20x gain). VoiceConfig exposed in TtsConfig [voice_settings] YAML table. Cloud path documents rate-knob absence; gain applies to both paths.
+
 ## v0.2.0 — 2026-05-28
 
 PipeWire output: audio actually plays
