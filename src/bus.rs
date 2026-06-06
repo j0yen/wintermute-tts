@@ -6,9 +6,74 @@
 //! [`crate::daemon`] decodes per-topic into the request enums below.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Subscribe prefix that captures all incoming `wm-tts` topics.
 pub const TOPIC_PREFIX: &str = "wm.tts.";
+
+/// A correlation id that threads one spoken turn across every daemon.
+///
+/// Minted at wake by `wm-audio` as `<unix_ms_hex>-<seq_hex>` and copied
+/// onto every downstream event in the same turn. `wm-tts` is the terminal
+/// daemon: it copies the inbound `turn_id` from the `wm.tts.speak` request
+/// onto its `wm.tts.start` / `wm.tts.end` events so a consumer can join the
+/// whole turn (wake → stt → dialog → brain → tts) by id.
+///
+/// The format is `<hex>-<hex>` but `wm-tts` treats the value as an opaque
+/// token — it only copies it through, never re-mints. The field is
+/// **optional** in every envelope: events without a `turn_id` (legacy, or
+/// from an upstream that hasn't adopted this PRD) remain valid and consumers
+/// MUST handle `None` gracefully.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(pub String);
+
+/// Global monotone counter for same-millisecond collision avoidance when
+/// `wm-tts` must mint a fallback id (a `speak` request that carried none).
+static TURN_SEQ: AtomicU32 = AtomicU32::new(0);
+
+impl TurnId {
+    /// Mint a fresh, collision-resistant `TurnId`. `wm-tts` only mints when
+    /// an inbound `speak` request carried no id (e.g. a system-injected
+    /// utterance); the normal path copies the upstream id through.
+    #[must_use]
+    pub fn mint() -> Self {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let seq = TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+        Self(format!("{ms:013x}-{seq:04x}"))
+    }
+
+    /// Parse a `TurnId` from a string slice, returning `None` if the format
+    /// does not match `<hex>-<hex>`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.splitn(2, '-');
+        let ms_part = parts.next()?;
+        let seq_part = parts.next()?;
+        if ms_part.is_empty()
+            || seq_part.is_empty()
+            || !ms_part.chars().all(|c| c.is_ascii_hexdigit())
+            || !seq_part.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self(s.to_owned()))
+    }
+
+    /// Borrow the underlying string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TurnId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Incoming topics handled by the daemon.
 pub mod incoming {
@@ -78,6 +143,12 @@ pub struct SpeakRequest {
     /// When `true`, cancel any in-flight utterance before starting this one.
     #[serde(default)]
     pub cancel_previous: bool,
+    /// Correlation id for the spoken turn this utterance answers. Copied
+    /// from the upstream `wm.brain.reply{turn_id}` that produced this
+    /// speak request, and re-emitted on `wm.tts.start` / `wm.tts.end`.
+    /// Optional/additive for backward compat (legacy requests carry none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 /// `wm.tts.reload_voice` payload.
@@ -100,6 +171,11 @@ pub struct StartEvent {
     pub source: String,
     /// Unix milliseconds when the speak request was accepted.
     pub ts: u64,
+    /// Turn correlation id copied from the inbound speak request. Shared
+    /// with `wm.tts.end` for the same utterance. Optional for backward
+    /// compat (absent when the speak request carried no id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 /// Outbound `wm.tts.cancel.ack` payload.
@@ -144,6 +220,12 @@ pub struct EndEvent {
     pub played_bytes: u64,
     /// Unix milliseconds when the utterance completed.
     pub ts: u64,
+    /// Turn correlation id copied from the inbound speak request, shared
+    /// with the paired `wm.tts.start`. This is the terminal event of a
+    /// turn, so a consumer joining by `turn_id` sees the whole span
+    /// close here. Optional for backward compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
 }
 
 /// Outbound `wm.tts.reload.ack` payload.
@@ -246,6 +328,7 @@ mod tests {
                 text: "hello".into(),
                 priority: None,
                 cancel_previous: false,
+                turn_id: None,
             })
         );
     }
@@ -263,8 +346,118 @@ mod tests {
                 text: "x".into(),
                 priority: Some("high".into()),
                 cancel_previous: true,
+                turn_id: None,
             })
         );
+    }
+
+    // ---- TurnId: AC1 (mint/parse, same-ms collision avoidance) ----
+
+    #[test]
+    fn turn_id_mint_is_parseable() {
+        let id = TurnId::mint();
+        assert_eq!(
+            TurnId::parse(id.as_str()).as_ref().map(TurnId::as_str),
+            Some(id.as_str()),
+            "a minted id must parse-round-trip"
+        );
+    }
+
+    #[test]
+    fn turn_id_two_mints_differ() {
+        // Same-millisecond mints must still differ (the seq counter).
+        let a = TurnId::mint();
+        let b = TurnId::mint();
+        assert_ne!(a, b, "two minted TurnIds must differ");
+    }
+
+    #[test]
+    fn turn_id_parse_rejects_garbage() {
+        assert!(TurnId::parse("").is_none());
+        assert!(TurnId::parse("no-dash-hex").is_none());
+        assert!(TurnId::parse("-abc").is_none());
+        assert!(TurnId::parse("abc-").is_none());
+    }
+
+    // ---- AC3: wm-tts copies the inbound turn_id onto start + end ----
+
+    #[test]
+    fn speak_request_decodes_inbound_turn_id() {
+        // A brain.reply-derived speak request carries a turn_id; decode
+        // must surface it so handle_speak can copy it onto start/end.
+        let req = decode_request(
+            incoming::SPEAK,
+            &json!({ "text": "ok", "turn_id": "0000000abc12-000f" }),
+        )
+        .expect("speak parses");
+        let Request::Speak(s) = req else {
+            panic!("expected Speak")
+        };
+        assert_eq!(
+            s.turn_id.as_ref().map(TurnId::as_str),
+            Some("0000000abc12-000f"),
+            "inbound turn_id must be carried on the decoded request"
+        );
+    }
+
+    #[test]
+    fn start_and_end_carry_same_turn_id() {
+        // AC3/AC6: start and end events emitted for one utterance share
+        // the inbound id (the field handle_speak copies through).
+        let id = TurnId::mint();
+        let start = StartEvent {
+            text: "hi".into(),
+            source: String::new(),
+            ts: 1,
+            turn_id: Some(id.clone()),
+        };
+        let end = EndEvent {
+            text: "hi".into(),
+            duration_ms: 10,
+            outcome: outcome::OK.to_string(),
+            played_bytes: 4,
+            ts: 2,
+            turn_id: Some(id.clone()),
+        };
+        assert_eq!(start.turn_id, end.turn_id, "start/end ids must match");
+        let sv = serde_json::to_value(&start).unwrap();
+        let ev = serde_json::to_value(&end).unwrap();
+        assert_eq!(sv["turn_id"], id.as_str());
+        assert_eq!(ev["turn_id"], id.as_str());
+    }
+
+    // ---- AC5: turn_id is optional/additive (backward compat) ----
+
+    #[test]
+    fn legacy_speak_request_without_turn_id() {
+        // A pre-PRD speak payload (no turn_id) must still decode, with None.
+        let req = decode_request(incoming::SPEAK, &json!({ "text": "legacy" }))
+            .expect("legacy speak must decode");
+        let Request::Speak(s) = req else {
+            panic!("expected Speak")
+        };
+        assert!(s.turn_id.is_none(), "absent turn_id must map to None");
+    }
+
+    #[test]
+    fn start_end_omit_turn_id_when_absent() {
+        // With no inbound id, the serialized event must not carry the
+        // field at all (skip_serializing_if) — legacy consumers unaffected.
+        let start = StartEvent {
+            text: "x".into(),
+            source: String::new(),
+            ts: 1,
+            turn_id: None,
+        };
+        let v = serde_json::to_value(&start).unwrap();
+        assert!(
+            v.get("turn_id").is_none(),
+            "absent turn_id must not appear in serialized start event"
+        );
+        // And a legacy start payload (no turn_id key) round-trips to None.
+        let back: StartEvent =
+            serde_json::from_value(json!({ "text": "x", "source": "", "ts": 1 })).unwrap();
+        assert!(back.turn_id.is_none());
     }
 
     #[test]
@@ -313,6 +506,7 @@ mod tests {
             text: "hi".into(),
             source: "claude-1-jsy".into(),
             ts: 42,
+            turn_id: None,
         };
         let v = serde_json::to_value(&ev).expect("serializes");
         let back: StartEvent = serde_json::from_value(v).expect("round trips");

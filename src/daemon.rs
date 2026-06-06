@@ -516,6 +516,7 @@ async fn handle_speak(
         text: req.text.clone(),
         source: req.priority.clone().unwrap_or_default(),
         ts,
+        turn_id: req.turn_id.clone(),
     };
     publish
         .publish(outgoing::START, serde_json::to_value(&start)?)
@@ -603,6 +604,7 @@ async fn handle_speak(
         outcome: result.outcome.to_string(),
         played_bytes: result.played_bytes,
         ts: now_unix_ms(),
+        turn_id: req.turn_id.clone(),
     };
     publish
         .publish(outgoing::END, serde_json::to_value(&end)?)
@@ -1364,6 +1366,7 @@ mod tests {
             text: "totally uncached phrase".into(),
             priority: Some("normal".into()),
             cancel_previous: false,
+            turn_id: None,
         };
         handle_speak(&state, &mut sink, &req)
             .await
@@ -1609,6 +1612,7 @@ mod tests {
             text: "uncached cloud-fallback phrase".into(),
             priority: None,
             cancel_previous: false,
+            turn_id: None,
         };
         handle_speak(&state, &mut sink, &req)
             .await
@@ -1676,6 +1680,7 @@ mod tests {
             text: "uncached mid-stream phrase".into(),
             priority: None,
             cancel_previous: false,
+            turn_id: None,
         };
         handle_speak(&state, &mut sink, &req)
             .await
@@ -1817,6 +1822,7 @@ mod tests {
             text: "hello".into(),
             priority: None,
             cancel_previous: false,
+            turn_id: None,
         };
         handle_speak(&state, &mut sink, &req)
             .await
@@ -1861,6 +1867,7 @@ mod tests {
             text: "yes".into(),
             priority: None,
             cancel_previous: false,
+            turn_id: None,
         };
         handle_speak(&state, &mut sink, &req)
             .await
@@ -1924,6 +1931,7 @@ mod tests {
             text: "long".into(),
             priority: None,
             cancel_previous: false,
+            turn_id: None,
         };
         // Spawn handle_speak; race with a cancel after 30ms.
         let state_arc = Arc::new(state);

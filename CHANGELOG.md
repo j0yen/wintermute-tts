@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.0 — 2026-06-05
+
+Turn-id propagation (PRD lucid-turn-id). `wm-tts` is the terminal daemon
+in a spoken turn; it now copies the inbound `turn_id` from the
+`wm.tts.speak` request (which carries it down from `wm.brain.reply`) onto
+its `wm.tts.start` and `wm.tts.end` events, so a consumer can join the
+whole turn (wake → stt → dialog → brain → tts) by a single correlation id
+instead of guessing on wall-clock timestamps.
+
+- New `TurnId` type in `bus` (dependency-free `<unix_ms_hex>-<seq_hex>`,
+  mint/parse, same-millisecond collision avoidance) mirroring the
+  `wm-audio` mint point.
+- `SpeakRequest`, `StartEvent`, and `EndEvent` gain an optional/additive
+  `turn_id` field (`skip_serializing_if = "Option::is_none"`): legacy
+  payloads with no id still decode and serialize exactly as before.
+- `handle_speak` threads the inbound id through to both emitted events.
+- Bumped the `agorabus` path dep from 0.8 to 0.9 to match the rest of the
+  voice fleet (stt/dialog already on 0.9); this also unblocks the build.
+
+Tests: 7 new (mint/parse round-trip + collision, start/end share the id,
+legacy-without-id decode, absent-id omission). Full lib suite 124/124 green.
+
 ## v0.3.0 — 2026-05-30
 
 Add speaking_rate knob (piper --length_scale) and output gain (WAV sample scaling) to the TTS path, with elder-friendly defaults (0.85x rate, 1.20x gain). VoiceConfig exposed in TtsConfig [voice_settings] YAML table. Cloud path documents rate-knob absence; gain applies to both paths.
