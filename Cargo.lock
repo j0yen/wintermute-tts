@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agorabus"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2015,7 +2015,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "wintermute-tts"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "agorabus",
  "anyhow",

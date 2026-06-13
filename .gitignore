@@ -5,3 +5,4 @@ Cargo.lock.bk
 # subagent isolation worktrees (Claude Code Agent --isolation=worktree
 # creates these inside the slice; never part of the slice artifact)
 .claude/worktrees/
+.cache/
