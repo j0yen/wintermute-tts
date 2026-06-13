@@ -64,7 +64,7 @@ path = "src/main.rs"
 real-hardware = []
 
 [dependencies]
-agorabus = { path = "../agorabus", version = "0.9" }
+agorabus = { path = "../agorabus", version = "0.10" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

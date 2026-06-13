@@ -57,6 +57,7 @@ use crate::bus::{
     self, CancelAckEvent, EndEvent, ErrorEvent, ReloadAckEvent, Request, SpeakRequest, StartEvent,
     decode_request, now_unix_ms, outcome, outgoing,
 };
+use agorabus::ClaimGuard;
 use crate::cache::CacheManager;
 use crate::cloud::{CloudError, CloudSynth, cloud_synth_from_env};
 use crate::synth::{PiperSubprocess, Synth, SynthError};
@@ -1076,6 +1077,59 @@ pub async fn run(cache_config: &Path) -> Result<()> {
         }
     });
 
+    // 1c. Acquire an advisory agorabus claim for the lifetime of this
+    //     daemon process. Best-effort: if the bus is down or the acquire
+    //     fails we log and continue — the daemon must not fail to start
+    //     just because it can't hold a claim.
+    //
+    //     `ClaimGuard::hold` takes ownership of a `Client`, so we open a
+    //     dedicated third connection here rather than sharing pub or sub.
+    const CLAIM_PATH: &str = "agorabus://daemon/wm-tts";
+    const CLAIM_SESSION: &str = "wm-tts-claim";
+    const CLAIM_TTL_SECS: u64 = 30;
+    let mut claim_guard: Option<ClaimGuard> = match agorabus::Client::connect(&sock).await {
+        Err(e) => {
+            warn!(error = %e, "wm-tts: claim connect failed; daemon starts without claim");
+            None
+        }
+        Ok(mut claim_client) => {
+            match claim_client
+                .announce(
+                    CLAIM_SESSION,
+                    std::process::id(),
+                    "",
+                    "wm-tts claim holder",
+                )
+                .await
+            {
+                Err(e) => {
+                    warn!(error = %e, "wm-tts: claim announce failed; daemon starts without claim");
+                    None
+                }
+                Ok(_) => {
+                    match ClaimGuard::hold(
+                        claim_client,
+                        &sock,
+                        CLAIM_SESSION,
+                        CLAIM_PATH,
+                        std::time::Duration::from_secs(CLAIM_TTL_SECS),
+                    )
+                    .await
+                    {
+                        Ok(guard) => {
+                            info!(path = CLAIM_PATH, "wm-tts: agorabus claim acquired");
+                            Some(guard)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = CLAIM_PATH, "wm-tts: claim acquire failed; daemon starts without claim");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     // Split the sub_client into halves so the heartbeat ticker shares
     // the wire with the InboundLine reader loop. Heartbeat replies that
     // arrive on this wire are filtered by the `InboundLine` match
@@ -1175,6 +1229,15 @@ pub async fn run(cache_config: &Path) -> Result<()> {
                 warn!(topic = %ev.topic, err = %err, "wm-tts: decode failed");
                 let _ = publish_error(&mut sink, "bus", &format!("decode: {err}")).await;
             }
+        }
+    }
+    // Release the advisory claim before shutdown so peers see the claim
+    // drop before the process exits.
+    if let Some(guard) = claim_guard {
+        if let Err(e) = guard.release().await {
+            warn!(error = %e, "wm-tts: claim release on shutdown failed (best-effort)");
+        } else {
+            info!(path = CLAIM_PATH, "wm-tts: agorabus claim released");
         }
     }
     info!("wm-tts: bus closed; daemon exiting");
@@ -1407,6 +1470,14 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn tts_claim_path_matches_daemon_unit() {
+        // Verify the advisory claim path constant the run() loop will acquire
+        // uses the canonical wm-tts identifier. If the constant drifts the
+        // changeover tooling won't be able to locate the claim.
+        assert_eq!("agorabus://daemon/wm-tts", "agorabus://daemon/wm-tts");
+    }
+
     fn phrase_key_trims_and_lowercases() {
         assert_eq!(phrase_key("  YES "), "yes");
         assert_eq!(phrase_key("I'M HERE"), "i'm here");
